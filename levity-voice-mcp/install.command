@@ -32,26 +32,27 @@ echo "==> Installing dependencies (this may take a few minutes on first run)..."
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q
 
-# Step 5: Add to Claude Desktop config
-echo "==> Configuring Claude Desktop..."
+# Step 5: Configure applications
+echo "==> Configuring applications..."
 
 PYTHON_PATH="$VENV_DIR/bin/python"
 SERVER_PATH="$CONFIG_DIR/server.py"
 
-if [ -f "$CLAUDE_CONFIG" ]; then
-    # Config exists — check if levity-voice is already there
-    if grep -q "levity-voice" "$CLAUDE_CONFIG" 2>/dev/null; then
-        echo "    levity-voice already in Claude config, skipping."
-    else
-        # Use python to safely merge into existing JSON
-        "$VENV_DIR/bin/python" -c "
-import json, sys
+register_mcp() {
+    local config_path="$1"
+    local app_name="$2"
 
-config_path = sys.argv[1]
+    if [ -f "$config_path" ]; then
+        if grep -q "levity-voice" "$config_path" 2>/dev/null; then
+            echo "    levity-voice already in $app_name config, skipping."
+        else
+            "$VENV_DIR/bin/python" -c "
+import json, sys
+path = sys.argv[1]
 python_path = sys.argv[2]
 server_path = sys.argv[3]
 
-with open(config_path) as f:
+with open(path) as f:
     config = json.load(f)
 
 if 'mcpServers' not in config:
@@ -62,27 +63,34 @@ config['mcpServers']['levity-voice'] = {
     'args': [server_path]
 }
 
-with open(config_path, 'w') as f:
-    json.dump(config, f, indent=2)
-
-print('    Added levity-voice to Claude config.')
-" "$CLAUDE_CONFIG" "$PYTHON_PATH" "$SERVER_PATH"
-    fi
-else
-    # No config file — create one
-    mkdir -p "$(dirname "$CLAUDE_CONFIG")"
-    cat > "$CLAUDE_CONFIG" << CONFIGEOF
+with open(path, 'w') as f:
+    json.dump(config, f, indent=4)
+" "$config_path" "$PYTHON_PATH" "$SERVER_PATH"
+            echo "    Added levity-voice to $app_name config."
+        fi
+    else
+        # If the parent directory exists (which means the app is installed/has been run)
+        local parent_dir
+        parent_dir="$(dirname "$config_path")"
+        if [ -d "$parent_dir" ]; then
+            cat > "$config_path" << CONFIGEOF
 {
-  "mcpServers": {
-    "levity-voice": {
-      "command": "$PYTHON_PATH",
-      "args": ["$SERVER_PATH"]
+    "mcpServers": {
+        "levity-voice": {
+            "command": "$PYTHON_PATH",
+            "args": ["$SERVER_PATH"]
+        }
     }
-  }
 }
 CONFIGEOF
-    echo "    Created Claude config with levity-voice."
-fi
+            echo "    Created $app_name config with levity-voice."
+        fi
+    fi
+}
+
+register_mcp "$CLAUDE_CONFIG" "Claude Desktop"
+register_mcp "$HOME/.gemini/antigravity-ide/mcp_config.json" "Antigravity IDE"
+register_mcp "$HOME/.gemini/antigravity/mcp_config.json" "standalone Antigravity App"
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
