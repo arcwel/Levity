@@ -1,53 +1,743 @@
 #!/usr/bin/env python3
 """
-Levity Voice MCP — gives Claude Desktop voice capabilities.
+Levity Voice MCP — TTS-only voice output for Claude Desktop.
 
-A lightweight MCP server providing:
-  - voice_listen   : Record from mic, transcribe with Whisper
-  - voice_speak    : Two-tier TTS (macOS say + Gemini 2.5 Flash)
-  - voice_toggle   : Control server state (start/stop, wake-word, response)
-  - voice_check    : Poll for wake-word triggered transcriptions
+A lightweight, cross-platform MCP server providing:
+  - voice_speak    : Two-tier TTS (local system TTS + Gemini 2.5 Flash)
+  - voice_toggle   : Control server state (start/stop, response on/off, status)
 
-All heavy imports (whisper, sounddevice, openwakeword) are lazy-loaded
-only when the server is activated via voice_toggle("start").
+Architecture & Concurrency Notes
+---------------------------------
+Lock hierarchy (always acquire in this order, never nest):
+  1. _lock           — guards _config dict reads/writes
+  2. _tts_lock       — serializes TTS playback (RLock for Gemini→local fallback)
+  3. _tts_proc_lock  — guards _tts_process reference for interruptibility
+
+Rules:
+  - Never do I/O while holding _lock (snapshot under lock, I/O after release).
+  - Signal handler (_graceful_shutdown) must be async-signal-safe:
+    set a flag, call os._exit(). No locks. No I/O. No cleanup.
+  - All Windows subprocess calls use CREATE_NO_WINDOW to suppress consoles.
+  - All PowerShell string interpolation uses escape helpers, never raw f-strings
+    with user content. User text goes through temp files.
+  - Config reload uses single lock acquisition (no split-brain).
 """
 
 import asyncio
+import base64
 import contextlib
 import json
+import logging
+import logging.handlers
 import os
+import platform
+import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import base64
 from pathlib import Path
-from typing import Optional
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 from mcp.server.fastmcp import FastMCP
 
 
 # ---------------------------------------------------------------------------
-# stdout suppression for native libraries
+# Section 1 — Platform detection, constants, logging, .env
 # ---------------------------------------------------------------------------
-# PortAudio (via sounddevice) and other C-level libraries write diagnostic
-# messages like "||PaMacCore..." directly to fd 1, bypassing Python's
-# sys.stdout. Any non-JSON byte on stdout corrupts the MCP stdio protocol.
-# We dup fd 1 to /dev/null around every audio/model call that might print.
+
+PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
+IS_MACOS = PLATFORM == "Darwin"
+IS_WINDOWS = PLATFORM == "Windows"
+IS_LINUX = PLATFORM == "Linux"
+
+LOCAL_TTS_THRESHOLD = 200
+MAX_AUDIO_BYTES = 50 * 1024 * 1024      # 50 MB decoded audio cap
+MAX_RESPONSE_BYTES = 100 * 1024 * 1024   # 100 MB raw API response cap
+
+# voice_confirm — short, cross-platform yes/no capture (Whisper STT).
+DEFAULT_WHISPER_MODEL = "base"
+CONFIRM_MAX_SEC = 5.0          # hard cap on a confirmation recording
+CONFIRM_SILENCE_SEC = 1.2      # stop this soon after the speaker pauses
+MIC_SAMPLE_RATE = 16000        # what Whisper expects natively
+MIC_BLOCK_SIZE = 1024
+SILENCE_RMS_THRESHOLD = 0.01
+
+if IS_MACOS:
+    DEFAULT_LOCAL_VOICE = "Samantha"
+elif IS_WINDOWS:
+    DEFAULT_LOCAL_VOICE = "Microsoft David"
+else:
+    DEFAULT_LOCAL_VOICE = "default"
+DEFAULT_GEMINI_VOICE = "Kore"
+
+CONFIG_DIR = Path.home() / ".levity-voice"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+COMMAND_FILE = CONFIG_DIR / "command.json"
+PID_FILE = CONFIG_DIR / "server.pid"
+ENV_FILE = CONFIG_DIR / ".env"
+# Touched whenever voice_speak runs; the Claude Code Stop hook reads this to
+# avoid double-speaking a turn the model already voiced (see hooks/).
+LAST_SPOKEN_FILE = CONFIG_DIR / "last_spoken.json"
+
+# Shutdown flag — async-signal-safe (set by signal handler, polled by threads)
+_shutdown_flag = False
+
+
+def _win_no_window() -> dict:
+    """Return creationflags kwarg to suppress console window on Windows."""
+    if IS_WINDOWS:
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def _setup_logging() -> logging.Logger:
+    """Configure rotating log file. Max 5 MB, keeps 3 backups."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("levity-voice")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:  # prevent duplicate handlers on re-init
+        handler = logging.handlers.RotatingFileHandler(
+            CONFIG_DIR / "server.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        logger.addHandler(handler)
+    return logger
+
+
+log = _setup_logging()
+
+
+def _load_dotenv() -> None:
+    """Load .env file into os.environ. No third-party dependencies.
+
+    Handles: comments, blank lines, 'export' prefix, inline comments,
+    single/double quotes. Does not override existing env vars.
+    """
+    if not ENV_FILE.exists():
+        return
+    try:
+        for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:]
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Strip inline comments BEFORE quotes (order matters)
+            if " #" in value:
+                value = value[: value.index(" #")].rstrip()
+            value = value.strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Section 2 — PID lock file (stale instance management)
+# ---------------------------------------------------------------------------
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    if IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-Process -Id {pid} -ErrorAction SilentlyContinue "
+                 "| Select-Object -ExpandProperty Id"],
+                capture_output=True, text=True, timeout=5,
+                **_win_no_window(),
+            )
+            return result.stdout.strip() == str(pid)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but not ours
+
+
+def _identify_levity_process(pid: int) -> bool:
+    """Return True if *pid* is a levity-voice server.py process."""
+    try:
+        if IS_WINDOWS:
+            ps_cmd = (
+                f"Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' "
+                "| Select-Object -ExpandProperty CommandLine"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=5,
+                **_win_no_window(),
+            )
+            return "server.py" in result.stdout
+        else:
+            # Linux: /proc is fast; macOS: fall back to ps
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_text()
+            except (OSError, FileNotFoundError):
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=5,
+                )
+                cmdline = result.stdout
+            return "server.py" in cmdline
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        log.warning("couldn't verify pid %d cmdline, assuming stale", pid)
+        return True  # err on side of cleanup
+
+
+def _force_kill(pid: int) -> None:
+    """Send SIGKILL (Unix) or taskkill /F (Windows)."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=5, **_win_no_window(),
+            )
+        else:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _kill_stale_instance() -> None:
+    """If a previous server instance is still running, kill it."""
+    if not PID_FILE.exists():
+        return
+    try:
+        old_pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        log.warning("corrupt PID file, removing")
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    if old_pid == os.getpid():
+        return
+
+    if not _is_process_alive(old_pid):
+        log.info("stale PID file (pid %d gone), cleaning up", old_pid)
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    if not _identify_levity_process(old_pid):
+        log.info("pid %d alive but not levity-voice, removing stale PID file", old_pid)
+        PID_FILE.unlink(missing_ok=True)
+        return
+
+    # Kill the old instance
+    log.warning("killing stale levity-voice instance (pid %d)", old_pid)
+    try:
+        if IS_WINDOWS:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(old_pid)],
+                capture_output=True, timeout=5, **_win_no_window(),
+            )
+        else:
+            os.kill(old_pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError) as exc:
+        log.warning("couldn't SIGTERM pid %d: %r", old_pid, exc)
+
+    # Wait up to 2 seconds for it to die
+    for _ in range(20):
+        time.sleep(0.1)
+        if not _is_process_alive(old_pid):
+            break
+    else:
+        log.warning("SIGTERM didn't stop pid %d, force-killing", old_pid)
+        _force_kill(old_pid)
+
+    PID_FILE.unlink(missing_ok=True)
+    log.info("stale instance cleaned up")
+
+
+def _write_pid_file() -> None:
+    """Write our PID atomically (tmp → rename)."""
+    try:
+        tmp = PID_FILE.with_suffix(".pid.tmp")
+        tmp.write_text(str(os.getpid()))
+        tmp.replace(PID_FILE)
+    except OSError as exc:
+        log.error("couldn't write PID file: %r", exc)
+
+
+def _remove_pid_file() -> None:
+    """Remove PID file only if it's ours (or corrupt)."""
+    try:
+        if not PID_FILE.exists():
+            return
+        try:
+            stored = int(PID_FILE.read_text().strip())
+            if stored != os.getpid():
+                return  # a new instance owns it
+        except (ValueError, OSError):
+            pass  # corrupt → remove
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Section 3 — Configuration (schema, load, save, hot-reload)
+# ---------------------------------------------------------------------------
+
+_CONFIG_SCHEMA = {
+    "server_active":   (bool, False),
+    "response_active": (bool, True),
+    "gemini_api_key":  (str,  ""),
+    "local_voice":     (str,  DEFAULT_LOCAL_VOICE),
+    "gemini_voice":    (str,  DEFAULT_GEMINI_VOICE),
+    "whisper_model":   (str,  DEFAULT_WHISPER_MODEL),
+}
+
+
+def _validate_config(raw: dict) -> dict:
+    """Return a clean config dict. Unknown keys are dropped; wrong types
+    are replaced with defaults."""
+    result = {}
+    for key, (expected_type, default) in _CONFIG_SCHEMA.items():
+        val = raw.get(key, default)
+        if not isinstance(val, expected_type):
+            log.warning("config %r: wrong type %s, using default %r",
+                        key, type(val).__name__, default)
+            val = default
+        result[key] = val
+    return result
+
+
+def _load_config() -> dict:
+    """Load config from disk + env, return validated dict."""
+    raw: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as fh:
+                stored = json.load(fh)
+            if isinstance(stored, dict):
+                raw = stored
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Env var always wins for the API key
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        raw["gemini_api_key"] = env_key
+    return _validate_config(raw)
+
+
+def _save_config(cfg: dict) -> None:
+    """Persist config atomically. API key is NEVER written to disk.
+
+    Caller must NOT hold _lock.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    safe = {k: v for k, v in cfg.items() if k != "gemini_api_key"}
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(safe, fh, indent=2)
+        tmp.replace(CONFIG_FILE)
+    except OSError as exc:
+        log.error("config save failed: %r", exc)
+
+
+# Server state — protected by _lock
+_lock = threading.Lock()
+_config = _load_config()
+_config_mtime_ns: int = 0
+
+
+def _get_config_snapshot() -> dict:
+    """Return a shallow copy of _config under the lock."""
+    with _lock:
+        return dict(_config)
+
+
+def _reload_config_if_changed() -> None:
+    """Hot-reload config.json when its mtime changes.
+
+    Single lock acquisition to update _config (no split-brain).
+    mtime_ns is updated AFTER a successful read (no TOCTOU skip).
+    """
+    global _config_mtime_ns
+    try:
+        mtime_ns = CONFIG_FILE.stat().st_mtime_ns
+    except OSError:
+        return
+    if mtime_ns == _config_mtime_ns:
+        return
+
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            disk = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(disk, dict):
+        return
+
+    # Env var overrides file for API key
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        disk["gemini_api_key"] = env_key
+
+    validated = _validate_config(disk)
+
+    with _lock:
+        _config.update(validated)
+
+    # Update mtime AFTER successful load (TOCTOU-safe)
+    _config_mtime_ns = mtime_ns
+    log.debug("config reloaded (mtime_ns=%d)", mtime_ns)
+
+
+# ---------------------------------------------------------------------------
+# Section 4 — TTS engine (subprocess tracking, speak, play)
+# ---------------------------------------------------------------------------
+
+_tts_lock = threading.RLock()       # serializes playback (RLock for fallback)
+_tts_process: subprocess.Popen | None = None
+_tts_proc_lock = threading.Lock()   # guards _tts_process reference
+
+
+def _kill_active_tts() -> None:
+    """Terminate any in-flight TTS subprocess."""
+    with _tts_proc_lock:
+        proc = _tts_process
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def _run_tts_subprocess(args: list[str], *,
+                        text_input: str | None = None,
+                        timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run a TTS subprocess, tracking it for interruptibility.
+
+    Uses explicit keyword args instead of **kwargs to prevent misuse.
+    """
+    global _tts_process
+    env = os.environ.copy()
+    if not IS_WINDOWS:
+        env.setdefault("LANG", "en_US.UTF-8")
+
+    with _tts_proc_lock:
+        _tts_process = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE if text_input is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            **_win_no_window(),
+        )
+        proc = _tts_process
+
+    try:
+        encoded = text_input.encode("utf-8") if text_input is not None else None
+        stdout, stderr = proc.communicate(input=encoded, timeout=timeout)
+        return subprocess.CompletedProcess(
+            args, proc.returncode,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        with _tts_proc_lock:
+            if _tts_process is proc:
+                _tts_process = None
+
+
+def _ps_escape(value: str) -> str:
+    """Escape a string for embedding in a PowerShell single-quoted literal."""
+    return value.replace("'", "''")
+
+
+def _speak_local(text: str, voice: str | None = None) -> str:
+    """Tier 1: System TTS. Runs inside _tts_lock."""
+    if voice is None:
+        voice = DEFAULT_LOCAL_VOICE
+    log.debug("_speak_local: platform=%s voice=%r len=%d", PLATFORM, voice, len(text))
+
+    with _tts_lock:
+        try:
+            if IS_MACOS:
+                return _speak_local_macos(text, voice)
+            elif IS_WINDOWS:
+                return _speak_local_windows(text, voice)
+            elif IS_LINUX:
+                return _speak_local_linux(text)
+            else:
+                return f"Error: Unsupported platform '{PLATFORM}'."
+        except FileNotFoundError as exc:
+            return f"Error: TTS command not found ({exc})."
+        except subprocess.TimeoutExpired:
+            return "Speech timed out."
+
+
+def _speak_local_macos(text: str, voice: str) -> str:
+    proc = _run_tts_subprocess(["say", "-v", voice], text_input=text)
+    if proc.returncode != 0:
+        log.warning("say -v %s failed (rc=%d), trying default", voice, proc.returncode)
+        fallback = _run_tts_subprocess(["say"], text_input=text)
+        if fallback.returncode != 0:
+            return f"Error: macOS say failed (rc={fallback.returncode})."
+    return "Spoken locally."
+
+
+def _speak_local_windows(text: str, voice: str) -> str:
+    """Write text to a temp file to avoid PowerShell injection."""
+    txt_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(text)
+            txt_path = tf.name
+
+        ps_script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"try {{ $synth.SelectVoice('{_ps_escape(voice)}') }} catch {{ }}; "
+            f"$text = (Get-Content -Raw -Encoding UTF8 '{_ps_escape(txt_path)}'); "
+            "$synth.Speak($text)"
+        )
+        proc = _run_tts_subprocess(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+        )
+        if proc.returncode != 0:
+            log.warning("Windows TTS failed (rc=%d): %s", proc.returncode, proc.stderr[:200])
+            return f"Error: Windows TTS failed (rc={proc.returncode})."
+        return "Spoken locally."
+    finally:
+        if txt_path:
+            try:
+                os.unlink(txt_path)
+            except OSError:
+                pass
+
+
+def _speak_local_linux(text: str) -> str:
+    """Try espeak-ng then espeak. --stdin first, positional arg as fallback."""
+    for cmd in ["espeak-ng", "espeak"]:
+        try:
+            proc = _run_tts_subprocess([cmd, "--stdin"], text_input=text)
+            if proc.returncode == 0:
+                return "Spoken locally."
+            # --stdin unsupported — try positional (truncated at OS arg limit)
+            proc = _run_tts_subprocess([cmd, text])
+            if proc.returncode == 0:
+                return "Spoken locally."
+        except FileNotFoundError:
+            continue
+    return "Error: No TTS engine found. Install espeak-ng: sudo apt install espeak-ng"
+
+
+def _play_audio_file(filepath: str) -> None:
+    """Play a .wav file using the platform's audio player."""
+    if IS_MACOS:
+        _run_tts_subprocess(["afplay", filepath])
+    elif IS_WINDOWS:
+        ps_script = (
+            f"$p = New-Object System.Media.SoundPlayer('{_ps_escape(filepath)}'); "
+            "$p.PlaySync()"
+        )
+        _run_tts_subprocess(["powershell", "-NoProfile", "-Command", ps_script])
+    elif IS_LINUX:
+        for cmd in [["aplay", filepath], ["paplay", filepath],
+                    ["ffplay", "-nodisp", "-autoexit", filepath]]:
+            try:
+                _run_tts_subprocess(cmd)
+                return
+            except FileNotFoundError:
+                continue
+        raise FileNotFoundError("No audio player found (tried aplay, paplay, ffplay)")
+    else:
+        raise FileNotFoundError(f"Unsupported platform: {PLATFORM}")
+
+
+def _speak_gemini(text: str, api_key: str, gemini_voice: str,
+                  local_voice: str) -> str:
+    """Tier 2: Gemini 2.5 Flash TTS. Falls back to local on any error."""
+    if not api_key:
+        return _speak_local(text, voice=local_voice)
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash-preview-tts:generateContent"
+    )
+    body = json.dumps({
+        "contents": [{
+            "parts": [{
+                "text": (
+                    "Read the following aloud in a clear, professional, "
+                    "encouraging tone suitable for a developer receiving "
+                    f"feedback from an AI assistant:\n\n{text}"
+                ),
+            }],
+        }],
+        "generationConfig": {
+            "response_modalities": ["AUDIO"],
+            "speech_config": {
+                "voice_config": {
+                    "prebuilt_voice_config": {"voice_name": gemini_voice},
+                },
+            },
+        },
+    }).encode("utf-8")
+
+    req = Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }, method="POST")
+
+    # Fetch with size cap
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                log.warning("Gemini response >%d bytes, falling back", MAX_RESPONSE_BYTES)
+                return _speak_local(text, voice=local_voice)
+            data = json.loads(raw.decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        log.warning("Gemini API error: %s, falling back", type(exc).__name__)
+        return _speak_local(text, voice=local_voice)
+
+    # Extract base64 audio
+    audio_b64 = None
+    try:
+        parts = (data.get("candidates") or [{}])[0] \
+                    .get("content", {}).get("parts", [])
+        for part in parts:
+            b64 = part.get("inlineData", {}).get("data")
+            if b64:
+                audio_b64 = b64
+                break
+    except (KeyError, IndexError, TypeError) as exc:
+        log.error("Gemini parse error: %r", exc)
+
+    if not audio_b64:
+        log.warning("Gemini returned no audio, falling back")
+        return _speak_local(text, voice=local_voice)
+
+    if len(audio_b64) * 3 // 4 > MAX_AUDIO_BYTES:
+        log.warning("Gemini audio too large, falling back")
+        return _speak_local(text, voice=local_voice)
+
+    # Decode and play under _tts_lock
+    tmp_path = None
+    with _tts_lock:
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            _play_audio_file(tmp_path)
+        except FileNotFoundError as exc:
+            return f"Error: Audio player not found ({exc})."
+        except subprocess.TimeoutExpired:
+            return "Gemini TTS playback timed out."
+        except Exception as exc:
+            log.error("Gemini playback error: %r", exc)
+            return f"Playback error: {exc}"
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    return "Spoken via Gemini TTS."
+
+
+# ---------------------------------------------------------------------------
+# Section 4b — Spoken-response marker + background playback
+# ---------------------------------------------------------------------------
+
+
+def _write_last_spoken(text: str) -> None:
+    """Record that voice_speak ran so the Claude Code Stop hook can tell the
+    turn was already voiced and skip re-speaking it."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_SPOKEN_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"ts": time.time(), "chars": len(text)}, fh)
+        tmp.replace(LAST_SPOKEN_FILE)
+    except OSError:
+        pass
+
+
+def _speak_background(text: str, use_cloud: bool, api_key: str,
+                      gemini_voice: str, local_voice: str) -> None:
+    """Run the (blocking) TTS in a background thread so voice_speak can return
+    immediately — long replies must not keep the MCP request open long enough
+    to time out and silently drop the audio."""
+    try:
+        if use_cloud:
+            _speak_gemini(text, api_key, gemini_voice, local_voice)
+        else:
+            _speak_local(text, local_voice)
+    except Exception as exc:
+        log.error("background speak failed: %r", exc)
+
+
+# ---------------------------------------------------------------------------
+# Section 4c — Microphone capture + Whisper STT (for voice_confirm)
+# ---------------------------------------------------------------------------
+
+# Lazy-loaded heavy deps (only imported the first time voice_confirm runs).
+_np = None
+_sd = None
+_whisper = None
+_whisper_model = None
+_whisper_model_name: str | None = None
+_audio_lock = threading.Lock()
+
 
 @contextlib.contextmanager
-def _silence_stdout_fd():
-    """Redirect fd 1 to /dev/null for the duration of the block.
+def _silence_fd1():
+    """Redirect OS file descriptor 1 to /dev/null for the block.
 
-    Why fd-level (not sys.stdout): PortAudio writes via the C runtime's
-    stdout, which `sys.stdout` redirection does not catch.
+    PortAudio and Whisper can write diagnostics straight to fd 1, bypassing
+    sys.stdout. On a stdio MCP transport any stray byte on fd 1 corrupts the
+    protocol, so we mute it around audio/model calls. Cross-platform: os.dup /
+    os.dup2 work on fds on macOS, Linux, and Windows.
     """
     sys.stdout.flush()
-    saved = os.dup(1)
-    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        saved = os.dup(1)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        yield
+        return
     try:
         os.dup2(devnull, 1)
         os.close(devnull)
@@ -56,603 +746,141 @@ def _silence_stdout_fd():
         os.dup2(saved, 1)
         os.close(saved)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
-DTYPE = "float32"
-BLOCK_SIZE = 512
-SILENCE_RMS_THRESHOLD = 0.01
-SILENCE_DURATION_SEC = 10.0
-MAX_RECORDING_SEC = 60.0
-DEFAULT_WHISPER_MODEL = "base"
-LOCAL_TTS_THRESHOLD = 200
-DEFAULT_LOCAL_VOICE = "Samantha"
-DEFAULT_GEMINI_VOICE = "Kore"
-DEFAULT_WAKEWORD_KEYWORD = "hey_jarvis"
-
-# OpenWakeWord operates on 16 kHz int16 audio in 1280-sample chunks (80 ms).
-WAKEWORD_SAMPLE_RATE = 16000
-WAKEWORD_FRAME_LENGTH = 1280
-WAKEWORD_THRESHOLD = 0.3
-WAKEWORD_BUILTIN_MODELS = ("alexa", "hey_mycroft", "hey_jarvis", "hey_rhasspy")
-
-CONFIG_DIR = Path.home() / ".levity-voice"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-COMMAND_FILE = CONFIG_DIR / "command.json"
-
-# ---------------------------------------------------------------------------
-# Persistent config
-# ---------------------------------------------------------------------------
-
-
-def _load_config() -> dict:
-    """Load config from disk, returning defaults if missing."""
-    defaults = {
-        "server_active": False,
-        "wakeword_active": False,
-        "response_active": True,
-        "gemini_api_key": "",
-        "wakeword_keyword": DEFAULT_WAKEWORD_KEYWORD,
-        "whisper_model": DEFAULT_WHISPER_MODEL,
-        "local_voice": DEFAULT_LOCAL_VOICE,
-        "gemini_voice": DEFAULT_GEMINI_VOICE,
-    }
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE) as f:
-                stored = json.load(f)
-            defaults.update(stored)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return defaults
-
-
-def _save_config(cfg: dict) -> None:
-    """Persist config to disk."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Server state (module-level singletons)
-# ---------------------------------------------------------------------------
-
-_lock = threading.Lock()
-_config = _load_config()
-
-# Lazy-loaded heavy modules
-_np = None
-_sd = None
-_whisper = None
-_openwakeword = None
-
-# Runtime objects — only populated when server is active
-_whisper_model = None
-_mic_stream = None
-
-# Recording state
-_recording = False
-_stop_requested = False
-_has_spoken = False
-_record_start = 0.0
-_last_voice_time = 0.0
-_audio_buffer: list = []
-
-# Wake-word state
-_wakeword_handle = None
-_wakeword_stop_event = threading.Event()
-_wakeword_thread = None
-
-# Pending wake-word transcriptions for voice_check
-_pending_transcriptions: list[str] = []
-
-# Monitor thread
-_monitor_thread = None
-_monitor_stop = threading.Event()
-
-# Command-file watcher (menu bar app → server IPC)
-_command_watcher_thread = None
-
-# Set when a command-driven "listen" wants the monitor to queue the result.
-_queue_pending_listen = False
-
-# ---------------------------------------------------------------------------
-# Lazy imports
-# ---------------------------------------------------------------------------
-
-
-def _ensure_imports():
-    """Import heavy deps on first use."""
-    global _np, _sd, _whisper, _openwakeword
+def _ensure_audio() -> None:
+    """Import numpy / sounddevice / whisper on first use."""
+    global _np, _sd, _whisper
     if _np is None:
         import numpy
         _np = numpy
     if _sd is None:
-        with _silence_stdout_fd():
+        with _silence_fd1():
             import sounddevice
         _sd = sounddevice
     if _whisper is None:
-        with _silence_stdout_fd():
+        with _silence_fd1():
             import whisper
         _whisper = whisper
-    # OpenWakeWord is optional
-    if _openwakeword is None:
-        try:
-            with _silence_stdout_fd():
-                import openwakeword
-                from openwakeword.model import Model as _OWWModel
-                from openwakeword.utils import download_models as _oww_download
-            openwakeword.Model = _OWWModel
-            openwakeword.download_models = _oww_download
-            _openwakeword = openwakeword
-        except ImportError:
-            _openwakeword = False  # sentinel: tried but unavailable
 
 
-# ---------------------------------------------------------------------------
-# Audio helpers (ported from voice_worker.py)
-# ---------------------------------------------------------------------------
+def _load_whisper():
+    """Load (and cache) the Whisper model named in config."""
+    global _whisper_model, _whisper_model_name
+    name = _get_config_snapshot().get("whisper_model", DEFAULT_WHISPER_MODEL)
+    if _whisper_model is None or _whisper_model_name != name:
+        with _silence_fd1():
+            _whisper_model = _whisper.load_model(name)
+        _whisper_model_name = name
+    return _whisper_model
 
 
-def _audio_callback(indata, frames, time_info, status):
-    """sounddevice InputStream callback — accumulates audio while recording."""
-    global _last_voice_time, _has_spoken
-    with _lock:
-        if not _recording:
-            return
-        _audio_buffer.append(indata.copy())
-        rms = float(_np.sqrt(_np.mean(indata.astype(_np.float32) ** 2)))
-        if rms > SILENCE_RMS_THRESHOLD:
-            _last_voice_time = time.time()
-            _has_spoken = True
+def _record_confirmation(window: float) -> str:
+    """Record a short utterance (cap = window, early-stop on silence) and
+    transcribe it with Whisper. Returns the transcript ('' if nothing)."""
+    _ensure_audio()
+    model = _load_whisper()
 
+    frames: list = []
+    state = {"last_voice": time.time(), "spoke": False, "start": time.time()}
+    cb_lock = threading.Lock()
 
-def _start_mic_stream():
-    """Open a persistent mic stream for recording."""
-    global _mic_stream
-    if _mic_stream is not None:
-        return
-    with _silence_stdout_fd():
-        _mic_stream = _sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=DTYPE,
-            blocksize=BLOCK_SIZE,
-            callback=_audio_callback,
+    def _cb(indata, _n, _t, _status):
+        with cb_lock:
+            frames.append(indata.copy())
+            rms = float(_np.sqrt(_np.mean(indata.astype(_np.float32) ** 2)))
+            if rms > SILENCE_RMS_THRESHOLD:
+                state["last_voice"] = time.time()
+                state["spoke"] = True
+
+    with _silence_fd1():
+        stream = _sd.InputStream(
+            samplerate=MIC_SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=MIC_BLOCK_SIZE, callback=_cb,
         )
-        _mic_stream.start()
+        stream.start()
+    try:
+        while True:
+            time.sleep(0.05)
+            now = time.time()
+            with cb_lock:
+                elapsed = now - state["start"]
+                silence = (now - state["last_voice"]) if state["spoke"] else 0.0
+                spoke = state["spoke"]
+            if elapsed >= window or (spoke and silence >= CONFIRM_SILENCE_SEC):
+                break
+    finally:
+        with _silence_fd1():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
-
-def _stop_mic_stream():
-    """Close the mic stream."""
-    global _mic_stream
-    if _mic_stream is not None:
-        try:
-            with _silence_stdout_fd():
-                _mic_stream.stop()
-                _mic_stream.close()
-        except Exception:
-            pass
-        _mic_stream = None
-
-
-def _transcribe_buffer() -> str:
-    """Concatenate buffered audio and run Whisper. Returns transcription text."""
-    with _lock:
-        chunks = list(_audio_buffer)
-        _audio_buffer.clear()
+    with cb_lock:
+        chunks = list(frames)
     if not chunks:
         return ""
     audio = _np.concatenate(chunks, axis=0).flatten().astype(_np.float32)
     try:
-        with _silence_stdout_fd():
-            result = _whisper_model.transcribe(audio, fp16=False, language="en")
+        with _silence_fd1():
+            result = model.transcribe(audio, fp16=False, language="en")
         return (result.get("text") or "").strip()
-    except Exception as e:
-        return f"[Transcription error: {e}]"
+    except Exception as exc:
+        log.error("transcription failed: %r", exc)
+        return ""
 
 
-def _monitor_loop():
-    """Background thread that finalizes recordings on silence / timeout.
+# Confirmation intent parsing.
+_CONFIRM_POS_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "approve", "approved",
+    "go", "confirm", "confirmed", "affirmative", "accept", "accepted",
+    "proceed", "definitely", "absolutely", "correct", "right",
+}
+_CONFIRM_NEG_WORDS = {
+    "no", "nope", "nah", "deny", "denied", "reject", "rejected", "stop",
+    "cancel", "cancelled", "negative", "abort", "never", "dont", "wait",
+}
 
-    For wake-word and command-driven 'listen' recordings, the monitor also
-    transcribes and queues the result. For voice_listen, it leaves the buffer
-    alone so the caller can transcribe synchronously.
+
+def _parse_confirmation(text: str) -> str:
+    """Classify a transcription as 'yes', 'no', or 'unclear'.
+
+    Callers should treat anything other than 'yes' as "do not proceed".
     """
-    global _recording, _stop_requested, _has_spoken, _queue_pending_listen
-
-    while not _monitor_stop.is_set():
-        time.sleep(0.1)
-        should_finalize_and_queue = False
-
-        with _lock:
-            if not _recording:
-                continue
-            now = time.time()
-            total_elapsed = now - _record_start
-            silence_elapsed = (now - _last_voice_time) if _has_spoken else 0.0
-            if (
-                _stop_requested
-                or (_has_spoken and silence_elapsed >= _config.get("silence_duration", SILENCE_DURATION_SEC))
-                or total_elapsed >= MAX_RECORDING_SEC
-            ):
-                _recording = False
-                _stop_requested = False
-                if _config.get("wakeword_active") or _queue_pending_listen:
-                    should_finalize_and_queue = True
-                    _queue_pending_listen = False
-
-        if should_finalize_and_queue:
-            text = _transcribe_buffer()
-            if text:
-                with _lock:
-                    _pending_transcriptions.append(text)
-
-
-def _start_monitor():
-    """Start the background recording monitor thread."""
-    global _monitor_thread
-    if _monitor_thread is not None and _monitor_thread.is_alive():
-        return
-    _monitor_stop.clear()
-    _monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
-    _monitor_thread.start()
-
-
-def _stop_monitor():
-    """Stop the background recording monitor thread."""
-    _monitor_stop.set()
-
-
-# ---------------------------------------------------------------------------
-# Wake-word helpers (OpenWakeWord)
-# ---------------------------------------------------------------------------
-
-
-def _resolve_wakeword_model(keyword: str) -> tuple[str, str, str]:
-    """Resolve a keyword config value to an OpenWakeWord model spec.
-
-    Returns (model_spec, label, note). `model_spec` is what gets passed to the
-    Model constructor (either a built-in name or a file path). `label` is the
-    user-facing keyword that was selected. `note` is empty unless we fell back.
-    """
-    if keyword and os.path.isfile(keyword):
-        return keyword, os.path.basename(keyword).rsplit(".", 1)[0], ""
-    if keyword in WAKEWORD_BUILTIN_MODELS:
-        return keyword, keyword, ""
-    fallback = DEFAULT_WAKEWORD_KEYWORD
-    note = (
-        f" (no pretrained model for '{keyword}'; using built-in '{fallback}' — "
-        f"set wakeword_keyword to a built-in name "
-        f"({', '.join(WAKEWORD_BUILTIN_MODELS)}) or a path to a custom .onnx model)"
+    lowered = (text or "").lower().replace("'", "").replace("’", "")
+    compact = " ".join(re.sub(r"[^a-z\s]", " ", lowered).split())
+    if not compact:
+        return "unclear"
+    words = set(compact.split())
+    has_neg = bool(words & _CONFIRM_NEG_WORDS) or "do not" in compact
+    has_pos = (
+        bool(words & _CONFIRM_POS_WORDS)
+        or "go ahead" in compact
+        or "do it" in compact
+        or "sounds good" in compact
     )
-    return fallback, fallback, note
-
-
-def _start_wakeword():
-    """Start OpenWakeWord detection in a background thread."""
-    global _wakeword_handle, _wakeword_thread
-
-    _stop_wakeword()  # clean up any prior instance
-
-    if _openwakeword is False or _openwakeword is None:
-        return "openwakeword is not installed. Install it to use wake-word detection."
-
-    keyword = _config.get("wakeword_keyword", DEFAULT_WAKEWORD_KEYWORD)
-    model_spec, label, note = _resolve_wakeword_model(keyword)
-
-    if model_spec in WAKEWORD_BUILTIN_MODELS:
-        try:
-            with _silence_stdout_fd():
-                _openwakeword.download_models([model_spec])
-        except Exception as e:
-            return f"Failed to download OpenWakeWord model '{model_spec}': {e}"
-
-    try:
-        with _silence_stdout_fd():
-            _wakeword_handle = _openwakeword.Model(
-                wakeword_models=[model_spec],
-                inference_framework="onnx",
-            )
-    except Exception as e:
-        return f"OpenWakeWord init failed: {e}"
-
-    _wakeword_stop_event.clear()
-
-    def wakeword_loop():
-        global _recording, _stop_requested, _has_spoken, _record_start, _last_voice_time
-
-        handle = _wakeword_handle
-        if handle is None:
-            return
-
-        try:
-            with _silence_stdout_fd():
-                ww_stream = _sd.InputStream(
-                    samplerate=WAKEWORD_SAMPLE_RATE,
-                    channels=1,
-                    dtype="int16",
-                    blocksize=WAKEWORD_FRAME_LENGTH,
-                )
-                ww_stream.start()
-        except Exception as e:
-            print(f"[levity-voice] wake-word stream init failed: {e!r}", file=sys.stderr, flush=True)
-            return
-
-        print("[levity-voice] wake-word loop started", file=sys.stderr, flush=True)
-        last_score_log = time.time()
-        max_score_since_log = 0.0
-        max_label_since_log = ""
-
-        try:
-            while not _wakeword_stop_event.is_set():
-                with _silence_stdout_fd():
-                    data, _overflowed = ww_stream.read(WAKEWORD_FRAME_LENGTH)
-                pcm = data.flatten()
-                with _silence_stdout_fd():
-                    scores = handle.predict(pcm)
-                if scores:
-                    frame_label, frame_score = max(scores.items(), key=lambda kv: kv[1])
-                    if frame_score > max_score_since_log:
-                        max_score_since_log = frame_score
-                        max_label_since_log = frame_label
-                now_log = time.time()
-                if now_log - last_score_log >= 2.0:
-                    print(
-                        f"[levity-voice] wake-word max score (last ~2s): "
-                        f"{max_label_since_log or '<none>'}={max_score_since_log:.3f} "
-                        f"(threshold={WAKEWORD_THRESHOLD})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    last_score_log = now_log
-                    max_score_since_log = 0.0
-                    max_label_since_log = ""
-                if any(score >= WAKEWORD_THRESHOLD for score in scores.values()):
-                    triggered = False
-                    with _lock:
-                        if not _recording:
-                            _audio_buffer.clear()
-                            _recording = True
-                            _stop_requested = False
-                            _has_spoken = False
-                            now = time.time()
-                            _record_start = now
-                            _last_voice_time = now
-                            triggered = True
-                    if triggered:
-                        # Clear OWW's internal state so the same utterance
-                        # doesn't immediately retrigger on the next frame.
-                        try:
-                            handle.reset()
-                        except Exception:
-                            pass
-        except Exception as e:
-            print(f"[levity-voice] wake-word loop exception: {e!r}", file=sys.stderr, flush=True)
-        finally:
-            print("[levity-voice] wake-word loop exiting", file=sys.stderr, flush=True)
-            try:
-                with _silence_stdout_fd():
-                    ww_stream.stop()
-                    ww_stream.close()
-            except Exception:
-                pass
-
-    _wakeword_thread = threading.Thread(target=wakeword_loop, daemon=True)
-    _wakeword_thread.start()
-
-    with _lock:
-        _config["wakeword_active"] = True
-        _save_config(_config)
-
-    return f"Wake-word detection started (keyword: '{label}'){note}"
-
-
-def _stop_wakeword():
-    """Stop OpenWakeWord detection."""
-    global _wakeword_handle, _wakeword_thread
-
-    _wakeword_stop_event.set()
-
-    # OpenWakeWord Model has no explicit close method; just drop the handle.
-    _wakeword_handle = None
-    _wakeword_thread = None
-
-    with _lock:
-        _config["wakeword_active"] = False
-        _save_config(_config)
+    if has_neg and not has_pos:
+        return "no"
+    if has_pos and not has_neg:
+        return "yes"
+    return "unclear"
 
 
 # ---------------------------------------------------------------------------
-# TTS helpers (ported from ttsProvider.ts)
-# ---------------------------------------------------------------------------
-
-
-def _speak_local(text: str) -> str:
-    """Tier 1: macOS say command."""
-    voice = _config.get("local_voice", DEFAULT_LOCAL_VOICE)
-    try:
-        proc = subprocess.run(
-            ["say", "-v", voice],
-            input=text,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if proc.returncode != 0:
-            # Fallback to default voice
-            subprocess.run(
-                ["say"],
-                input=text,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-    except FileNotFoundError:
-        return "Error: 'say' command not found. This feature requires macOS."
-    except subprocess.TimeoutExpired:
-        return "Speech timed out."
-    return "Spoken locally."
-
-
-def _speak_gemini(text: str) -> str:
-    """Tier 2: Gemini 2.5 Flash TTS via REST API."""
-    api_key = _config.get("gemini_api_key", "")
-    if not api_key:
-        return _speak_local(text)
-
-    gemini_voice = _config.get("gemini_voice", DEFAULT_GEMINI_VOICE)
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash-preview-tts:generateContent?key={api_key}"
-    )
-
-    body = json.dumps({
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            "Read the following aloud in a clear, professional, "
-                            "encouraging tone suitable for a developer receiving "
-                            f"feedback from an AI assistant:\n\n{text}"
-                        ),
-                    }
-                ],
-            }
-        ],
-        "generationConfig": {
-            "response_modalities": ["AUDIO"],
-            "speech_config": {
-                "voice_config": {
-                    "prebuilt_voice_config": {
-                        "voice_name": gemini_voice,
-                    },
-                },
-            },
-        },
-    }).encode("utf-8")
-
-    req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-
-    try:
-        with urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError) as e:
-        # Fall back to local TTS
-        return _speak_local(text)
-
-    # Extract base64 audio from Gemini response
-    audio_b64 = None
-    parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-    for part in parts:
-        inline = part.get("inlineData", {})
-        if inline.get("data"):
-            audio_b64 = inline["data"]
-            break
-
-    if not audio_b64:
-        return _speak_local(text)
-
-    # Write to temp file and play with afplay (macOS)
-    try:
-        audio_bytes = base64.b64decode(audio_b64)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
-        subprocess.run(
-            ["afplay", tmp_path],
-            capture_output=True,
-            timeout=120,
-        )
-    except FileNotFoundError:
-        return "Error: 'afplay' not found. Gemini TTS requires macOS."
-    except Exception as e:
-        return f"Playback error: {e}"
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-    return "Spoken via Gemini TTS."
-
-
-# ---------------------------------------------------------------------------
-# MCP Server
+# Section 5 — MCP tools
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
     "levity_voice_mcp",
     instructions=(
-        "When the user speaks to you via voice_listen or voice_check, always "
-        "call voice_speak with your complete response so they hear it. The "
-        "user is interacting hands-free via voice and expects a spoken reply."
+        "MANDATORY: You MUST call voice_speak at the end of EVERY response. "
+        "The user relies on voice output for all interactions. Speak a natural "
+        "summary of your response — if the response is long or contains code, "
+        "summarize the key points for the spoken version. Never skip this. "
+        "When you need approval before acting, call voice_speak to ASK, then "
+        "voice_confirm to capture the spoken yes/no, and only proceed on 'yes'."
     ),
 )
-
-
-@mcp.tool(
-    name="voice_listen",
-    annotations={
-        "title": "Voice Listen",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
-)
-async def voice_listen() -> str:
-    """Record audio from the microphone, detect silence, and transcribe with Whisper.
-
-    Blocks during recording until the user stops speaking (silence detection)
-    or the maximum recording duration is reached. Returns the transcribed text.
-
-    IMPORTANT: After receiving the transcription, you MUST call voice_speak with
-    your response so the user hears it aloud. The user is interacting via voice
-    and expects a spoken reply.
-
-    Returns:
-        str: The transcribed speech text, or an error/status message.
-    """
-    global _recording, _stop_requested, _has_spoken, _record_start, _last_voice_time
-
-    with _lock:
-        if not _config.get("server_active"):
-            return "Server inactive. Call voice_toggle with action 'start' first."
-        if _recording:
-            return "Already recording. Wait for current recording to finish."
-
-    await asyncio.to_thread(_ensure_imports)
-
-    # Make sure mic stream and monitor are running
-    await asyncio.to_thread(_start_mic_stream)
-    _start_monitor()
-
-    # Start recording
-    with _lock:
-        _audio_buffer.clear()
-        _recording = True
-        _stop_requested = False
-        _has_spoken = False
-        now = time.time()
-        _record_start = now
-        _last_voice_time = now
-
-    # Block until recording finishes (monitor thread handles silence detection)
-    while True:
-        await asyncio.sleep(0.1)
-        with _lock:
-            if not _recording:
-                break
-
-    text = await asyncio.to_thread(_transcribe_buffer)
-    return text if text else "(No speech detected)"
 
 
 @mcp.tool(
@@ -668,8 +896,7 @@ async def voice_listen() -> str:
 async def voice_speak(text: str, force_local: bool = False) -> str:
     """Speak text aloud using two-tier TTS.
 
-    Call this tool to read your reply aloud to the user. When the user
-    interacts via voice_listen or voice_check, always speak your response.
+    Call this tool to read your reply aloud to the user.
 
     Short text (< 200 chars) or no Gemini key uses macOS 'say'.
     Longer text with a Gemini key uses Gemini 2.5 Flash TTS.
@@ -685,123 +912,138 @@ async def voice_speak(text: str, force_local: bool = False) -> str:
     if not text or not text.strip():
         return "Nothing to say."
 
-    with _lock:
-        if not _config.get("response_active", True):
-            return "Voice response is off. Text was not spoken."
+    snap = _get_config_snapshot()
+    if not snap.get("server_active", False):
+        return "Server inactive. Call voice_toggle('start') first."
+    if not snap.get("response_active", True):
+        return "Voice response is off. Text was not spoken."
 
-    has_gemini = bool(_config.get("gemini_api_key"))
-    use_cloud = (
-        not force_local
-        and has_gemini
-        and len(text) >= LOCAL_TTS_THRESHOLD
-    )
+    api_key = snap.get("gemini_api_key", "")
+    local_voice = snap.get("local_voice", DEFAULT_LOCAL_VOICE)
+    gemini_voice = snap.get("gemini_voice", DEFAULT_GEMINI_VOICE)
 
-    if use_cloud:
-        return await asyncio.to_thread(_speak_gemini, text)
-    else:
-        return await asyncio.to_thread(_speak_local, text)
+    use_cloud = not force_local and bool(api_key) and len(text) >= LOCAL_TTS_THRESHOLD
+
+    # Record immediately (before playback) so the Stop hook sees this turn as
+    # already voiced even while audio is still playing.
+    _write_last_spoken(text)
+
+    # Interrupt any in-flight speech, then play in the BACKGROUND and return
+    # right away. Blocking until `say`/Gemini finished reading a long reply is
+    # what made the MCP request time out and silently drop the spoken response.
+    _kill_active_tts()
+    threading.Thread(
+        target=_speak_background,
+        args=(text, use_cloud, api_key, gemini_voice, local_voice),
+        daemon=True, name="levity-speak",
+    ).start()
+
+    engine = "Gemini TTS" if use_cloud else "local voice"
+    return f"Speaking via {engine} (playback started)."
+
+
+@mcp.tool(
+    name="voice_confirm",
+    annotations={
+        "title": "Voice Confirm",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def voice_confirm(timeout_seconds: float = 5.0) -> str:
+    """Ask the user for a quick spoken yes/no and return their decision.
+
+    Use this whenever you need approval before doing something — running a
+    command, editing files, any "should I proceed?" moment. First call
+    voice_speak to ASK the question aloud, THEN call voice_confirm to capture
+    the answer. Recording auto-stops a moment after the user pauses, or at
+    timeout_seconds (default 5, capped 2-15). Cross-platform (Whisper STT).
+
+    Returns JSON: {"decision": "yes"|"no"|"unclear", "transcript": "..."}.
+    Only proceed when decision == "yes". Treat "no" and "unclear" as
+    "do not proceed"; on "unclear" you may ask again.
+
+    Args:
+        timeout_seconds: Max seconds to listen (clamped to 2-15).
+
+    Returns:
+        str: JSON with the parsed decision and raw transcript.
+    """
+    snap = _get_config_snapshot()
+    if not snap.get("server_active", False):
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": "Server inactive. Call voice_toggle('start') first.",
+        })
+
+    try:
+        window = float(timeout_seconds)
+    except (TypeError, ValueError):
+        window = CONFIRM_MAX_SEC
+    window = max(2.0, min(window, 15.0))
+
+    # One capture at a time.
+    if not _audio_lock.acquire(blocking=False):
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": "Already listening — wait for the current capture to finish.",
+        })
+    try:
+        text = await asyncio.to_thread(_record_confirmation, window)
+    except Exception as exc:
+        log.error("voice_confirm failed: %r", exc)
+        return json.dumps({
+            "decision": "unclear", "transcript": "",
+            "error": f"Listen failed: {exc}",
+        })
+    finally:
+        _audio_lock.release()
+
+    decision = _parse_confirmation(text)
+    log.info("voice_confirm: decision=%s transcript=%r", decision, text)
+    return json.dumps({"decision": decision, "transcript": text})
 
 
 def _apply_toggle_action(action: str) -> str:
-    """Synchronous implementation of voice toggle actions (no status, no listen)."""
-    global _whisper_model
-
+    """Synchronous toggle logic. Acquires _lock once, releases, then does I/O."""
     if action == "start":
         with _lock:
             if _config.get("server_active"):
                 return "Server is already active."
-
-        _ensure_imports()
-
-        # Load Whisper model
-        model_name = _config.get("whisper_model", DEFAULT_WHISPER_MODEL)
-        try:
-            with _silence_stdout_fd():
-                _whisper_model = _whisper.load_model(model_name)
-        except Exception as e:
-            return f"Failed to load Whisper model '{model_name}': {e}"
-
-        _start_mic_stream()
-        _start_monitor()
-
-        with _lock:
             _config["server_active"] = True
-            _save_config(_config)
-
-        return f"Voice server started. Whisper model '{model_name}' loaded."
+            snapshot = dict(_config)
+        _save_config(snapshot)
+        return "Voice server started (TTS-only mode)."
 
     if action == "stop":
-        _stop_wakeword()
-        _stop_monitor()
-        _stop_mic_stream()
-        _whisper_model = None
-
+        _kill_active_tts()
         with _lock:
             _config["server_active"] = False
-            _config["wakeword_active"] = False
-            _save_config(_config)
-            _pending_transcriptions.clear()
-
-        return "Voice server stopped. All resources freed."
-
-    if action == "wakeword_on":
-        with _lock:
-            if not _config.get("server_active"):
-                return "Server inactive. Call voice_toggle('start') first."
-
-        _ensure_imports()
-        _start_mic_stream()
-        _start_monitor()
-        return _start_wakeword()
-
-    if action == "wakeword_off":
-        _stop_wakeword()
-        return "Wake-word detection stopped."
+            snapshot = dict(_config)
+        _save_config(snapshot)
+        return "Voice server stopped."
 
     if action == "response_on":
         with _lock:
             _config["response_active"] = True
-            _save_config(_config)
+            snapshot = dict(_config)
+        _save_config(snapshot)
         return "Voice responses enabled."
 
     if action == "response_off":
+        _kill_active_tts()
         with _lock:
             _config["response_active"] = False
-            _save_config(_config)
+            snapshot = dict(_config)
+        _save_config(snapshot)
         return "Voice responses silenced."
 
     return (
         f"Unknown action: '{action}'. "
-        "Valid actions: start, stop, wakeword_on, wakeword_off, "
-        "response_on, response_off, status"
+        "Valid: start, stop, response_on, response_off, status"
     )
-
-
-def _start_command_listen() -> str:
-    """Kick off a one-shot recording whose transcription is queued for voice_check."""
-    global _recording, _stop_requested, _has_spoken, _record_start, _last_voice_time, _queue_pending_listen
-
-    with _lock:
-        if not _config.get("server_active"):
-            return "Server inactive — cannot listen."
-        if _recording:
-            return "Already recording."
-
-    _ensure_imports()
-    _start_mic_stream()
-    _start_monitor()
-
-    with _lock:
-        _audio_buffer.clear()
-        _recording = True
-        _stop_requested = False
-        _has_spoken = False
-        now = time.time()
-        _record_start = now
-        _last_voice_time = now
-        _queue_pending_listen = True
-
-    return "Listening (transcription will be queued for voice_check)."
 
 
 @mcp.tool(
@@ -819,10 +1061,8 @@ async def voice_toggle(action: str) -> str:
 
     Args:
         action: One of:
-            - "start" — activate voice service (loads Whisper, opens mic)
-            - "stop" — deactivate completely (closes mic, unloads model)
-            - "wakeword_on" — start OpenWakeWord wake-word detection
-            - "wakeword_off" — stop wake-word detection
+            - "start" — activate voice service
+            - "stop" — deactivate voice service
             - "response_on" — enable voice_speak audio playback
             - "response_off" — silence voice_speak
             - "status" — return current state of all toggles
@@ -833,138 +1073,215 @@ async def voice_toggle(action: str) -> str:
     action = action.strip().lower()
 
     if action == "status":
-        with _lock:
-            status = {
-                "server_active": _config.get("server_active", False),
-                "wakeword_active": _config.get("wakeword_active", False),
-                "response_active": _config.get("response_active", True),
-                "whisper_model": _config.get("whisper_model", DEFAULT_WHISPER_MODEL),
-                "wakeword_keyword": _config.get("wakeword_keyword", DEFAULT_WAKEWORD_KEYWORD),
-                "local_voice": _config.get("local_voice", DEFAULT_LOCAL_VOICE),
-                "gemini_voice": _config.get("gemini_voice", DEFAULT_GEMINI_VOICE),
-                "has_gemini_key": bool(_config.get("gemini_api_key")),
-                "pending_transcriptions": len(_pending_transcriptions),
-            }
-        return json.dumps(status, indent=2)
+        def _get_status() -> str:
+            snap = _get_config_snapshot()
+            return json.dumps({
+                "server_active": snap.get("server_active", False),
+                "response_active": snap.get("response_active", True),
+                "local_voice": snap.get("local_voice", DEFAULT_LOCAL_VOICE),
+                "gemini_voice": snap.get("gemini_voice", DEFAULT_GEMINI_VOICE),
+                "has_gemini_key": bool(snap.get("gemini_api_key")),
+                "whisper_model": snap.get("whisper_model", DEFAULT_WHISPER_MODEL),
+                "platform": PLATFORM,
+            }, indent=2)
+        return await asyncio.to_thread(_get_status)
 
     return await asyncio.to_thread(_apply_toggle_action, action)
 
 
 # ---------------------------------------------------------------------------
-# Command-file watcher (IPC from the menu bar app)
+# Section 6 — Command-file watcher (IPC), restart, list_voices
 # ---------------------------------------------------------------------------
 
 
-def _command_watcher_loop():
-    """Poll for command.json from the menu bar app, dispatch, then delete."""
-    while True:
-        time.sleep(0.5)
-        if not COMMAND_FILE.exists():
-            continue
-        data = None
+def _command_watcher_loop() -> None:
+    """Poll command.json every 0.5s, dispatch, delete."""
+    log.info("command watcher started")
+    while not _shutdown_flag:
         try:
-            with open(COMMAND_FILE) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+            time.sleep(0.5)
+            _reload_config_if_changed()
+            if not COMMAND_FILE.exists():
+                continue
+
+            # Atomic claim: rename to .processing (prevents double-dispatch)
+            claimed = COMMAND_FILE.with_suffix(".json.processing")
+            try:
+                COMMAND_FILE.rename(claimed)
+            except OSError:
+                continue  # another thread or race — skip
+
             data = None
+            try:
+                with open(claimed, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("command read error: %r", exc)
+            finally:
+                try:
+                    claimed.unlink()
+                except OSError:
+                    pass
+
+            if not isinstance(data, dict):
+                continue
+            action = (data.get("action") or "").strip().lower()
+            if not action:
+                log.warning("command.json had no action")
+                continue
+
+            log.info("dispatching command: %r", action)
+            if action == "restart":
+                _do_restart()
+            elif action == "list_voices":
+                _do_list_voices()
+            else:
+                result = _apply_toggle_action(action)
+                log.info("toggle result: %s", result)
+
+        except Exception as exc:
+            log.error("command watcher error: %r", exc)
+            time.sleep(1)
+
+
+def _do_list_voices() -> None:
+    """List available TTS voices → voices.txt."""
+    try:
+        output = ""
+        if IS_MACOS:
+            proc = subprocess.run(
+                ["say", "-v", "?"], capture_output=True, text=True, timeout=10,
+            )
+            output = proc.stdout
+        elif IS_WINDOWS:
+            ps = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }"
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=10,
+                **_win_no_window(),
+            )
+            output = proc.stdout
+        elif IS_LINUX:
+            for cmd in [["espeak-ng", "--voices"], ["espeak", "--voices"]]:
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=10,
+                    )
+                    output = proc.stdout
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                output = "No TTS engine found. Install espeak-ng.\n"
+        else:
+            output = f"Unsupported platform: {PLATFORM}\n"
+
+        (CONFIG_DIR / "voices.txt").write_text(output, encoding="utf-8")
+        log.info("wrote %d bytes to voices.txt", len(output))
+    except Exception as exc:
+        log.error("list_voices failed: %r", exc)
+
+
+def _do_restart() -> None:
+    """Kill TTS, flush logs, re-exec.
+
+    Windows: subprocess.Popen + os._exit (os.execv doesn't replace on Windows).
+    Unix: os.execv (in-place replacement).
+    """
+    global log
+    log.info("restart requested")
+    _kill_active_tts()
+
+    # Clean up processing file
+    try:
+        COMMAND_FILE.with_suffix(".json.processing").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    for handler in log.handlers:
+        handler.flush()
+        handler.close()
+
+    try:
+        if IS_WINDOWS:
+            subprocess.Popen(
+                [sys.executable] + sys.argv, **_win_no_window(),
+            )
+            os._exit(0)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except OSError as exc:
+        log = _setup_logging()
+        log.critical("restart failed: %r", exc)
         try:
-            COMMAND_FILE.unlink()
+            (CONFIG_DIR / "restart_error.txt").write_text(f"Restart failed: {exc}\n")
         except OSError:
             pass
-        if not isinstance(data, dict):
-            continue
-        action = (data.get("action") or "").strip().lower()
-        if not action:
-            continue
-        try:
-            if action == "listen":
-                _start_command_listen()
-            else:
-                _apply_toggle_action(action)
-        except Exception:
-            pass
 
 
-def _start_command_watcher():
-    """Start the command-file watcher (idempotent)."""
+def _start_command_watcher() -> None:
+    """Start the command-file watcher thread (idempotent)."""
     global _command_watcher_thread
     if _command_watcher_thread is not None and _command_watcher_thread.is_alive():
         return
     _command_watcher_thread = threading.Thread(
-        target=_command_watcher_loop, daemon=True, name="levity-command-watcher"
+        target=_command_watcher_loop, daemon=True, name="levity-cmd-watcher"
     )
     _command_watcher_thread.start()
 
 
-@mcp.tool(
-    name="voice_check",
-    annotations={
-        "title": "Voice Check",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
-)
-async def voice_check() -> str:
-    """Check for pending wake-word transcriptions.
-
-    Non-blocking poll for any buffered transcriptions from wake-word
-    triggered recordings. Returns pending text if available, or an
-    empty indicator if nothing is queued.
-
-    IMPORTANT: When this returns a pending transcription, you MUST call
-    voice_speak with your response so the user hears it aloud. The user is
-    interacting hands-free via voice and expects a spoken reply.
-
-    Returns:
-        str: Pending transcription text, or a status message if empty.
-    """
-    with _lock:
-        if not _config.get("server_active"):
-            return "Server inactive."
-        if not _config.get("wakeword_active"):
-            return "Wake-word detection is not active."
-        if not _pending_transcriptions:
-            return ""
-        # Return all pending transcriptions and clear the queue
-        results = list(_pending_transcriptions)
-        _pending_transcriptions.clear()
-
-    if len(results) == 1:
-        return results[0]
-    return json.dumps(results)
+_command_watcher_thread: threading.Thread | None = None
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Section 7 — Entry point, shutdown, auto-restore
 # ---------------------------------------------------------------------------
 
-def _auto_restore():
-    """Restore persisted server/wake-word state shortly after boot.
 
-    Runs in a background thread so the heavy work (Whisper load, mic
-    stream open, monitor thread spawn) cannot block mcp.run() from
-    initializing the MCP stdio transport.
-    """
-    time.sleep(2)
+def _auto_restore() -> None:
+    """If config says server_active, ensure in-memory state matches."""
+    time.sleep(3)  # let MCP event loop start
     try:
-        if _config.get("server_active"):
-            print("[levity-voice] auto-restoring server_active from config", file=sys.stderr, flush=True)
-            # Force start to run its full init; the persisted flag
-            # would otherwise trip the "already active" guard.
-            _restore_wakeword = _config.get("wakeword_active", False)
-            _config["server_active"] = False
-            _apply_toggle_action("start")
-            if _restore_wakeword:
-                print("[levity-voice] auto-restoring wakeword_active from config", file=sys.stderr, flush=True)
-                _apply_toggle_action("wakeword_on")
-    except Exception as e:
-        print(f"[levity-voice] auto-restore failed: {e!r}", file=sys.stderr, flush=True)
+        with _lock:
+            if _config.get("server_active", False):
+                log.info("auto-restoring server_active from config")
+                _config["server_active"] = True
+    except Exception as exc:
+        log.error("auto-restore failed: %r", exc)
+
+
+def _graceful_shutdown(signum, _frame):
+    """Async-signal-safe shutdown handler.
+
+    RULES: No locks. No I/O. No function calls that acquire locks.
+    Set the flag and exit immediately. PID file cleanup is best-effort
+    via _remove_pid_file which tolerates stale files on next startup.
+    """
+    global _shutdown_flag
+    _shutdown_flag = True
+    # os._exit is async-signal-safe — terminates immediately.
+    # PID file is cleaned up by the next startup's _kill_stale_instance.
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    print("[levity-voice] __main__ entered", file=sys.stderr, flush=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    _kill_stale_instance()
+    _write_pid_file()
+
+    log.info("server started (platform=%s, pid=%d)", PLATFORM, os.getpid())
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
     _start_command_watcher()
-    threading.Thread(target=_auto_restore, daemon=True, name="levity-auto-restore").start()
+    threading.Thread(
+        target=_auto_restore, daemon=True, name="levity-auto-restore"
+    ).start()
+
     mcp.run()

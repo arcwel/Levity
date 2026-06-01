@@ -19,9 +19,16 @@ echo ""
 echo "==> Creating config directory at $CONFIG_DIR"
 mkdir -p "$CONFIG_DIR"
 
-# Step 2: Copy server.py to config dir for stable path
+# Step 2: Copy server + companion files to config dir for stable paths
 echo "==> Copying server.py to $CONFIG_DIR"
 cp "$SCRIPT_DIR/server.py" "$CONFIG_DIR/server.py"
+# Menu-bar app (optional) and the Claude Code Stop hook.
+[ -f "$SCRIPT_DIR/menubar.py" ] && cp "$SCRIPT_DIR/menubar.py" "$CONFIG_DIR/menubar.py"
+if [ -d "$SCRIPT_DIR/hooks" ]; then
+    mkdir -p "$CONFIG_DIR/hooks"
+    cp "$SCRIPT_DIR/hooks/"*.py "$CONFIG_DIR/hooks/" 2>/dev/null || true
+    chmod +x "$CONFIG_DIR/hooks/"*.py 2>/dev/null || true
+fi
 
 # Step 3: Create venv
 echo "==> Creating Python venv at $VENV_DIR"

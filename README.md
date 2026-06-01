@@ -20,15 +20,18 @@ Both share the same design: **local-first, bring-your-own-key (BYOK), no telemet
 
 ## Platform support
 
-| Platform | Status | Notes |
-| :-- | :-- | :-- |
-| **macOS** | ✅ Supported | Primary target. Uses the built-in `say` and `afplay` commands for speech. |
-| **Windows 11** | 🔜 Coming soon | In active development — not yet functional. See [Windows: coming soon](#windows-coming-soon). |
-| **Linux** | 🔜 Coming soon | The architecture supports it; audio shims are planned. Contributions welcome. |
+The `levity-voice-mcp` server is **cross-platform**. It auto-detects the OS and
+uses the native speech engine on each:
 
-> **Heads-up:** today the speech features depend on macOS-only commands
-> (`say`, `afplay`). Windows and Linux support is on the way — see
-> [Windows: coming soon](#windows-coming-soon).
+| Platform | Status | Speech engine |
+| :-- | :-- | :-- |
+| **macOS** | ✅ Supported | `say` + `afplay` (built in) |
+| **Windows 11** | ✅ Supported | PowerShell `System.Speech` (SAPI) + `System.Media.SoundPlayer` (built in) |
+| **Linux** | ✅ Supported | `espeak-ng`/`espeak` (`sudo apt install espeak-ng`) + `aplay`/`paplay`/`ffplay` |
+
+Speech-to-text for `voice_confirm` uses Whisper, which runs on all three. The
+older `antigravity-voice` VS Code extension is still macOS-focused; the
+cross-platform support above applies to the MCP server.
 
 ---
 
@@ -51,9 +54,10 @@ Optional, depending on features you enable:
   higher-quality cloud TTS voice and, in the extension, AI command processing.
   Without it, everything falls back to the local system voice.
 - **Picovoice access key** (free at [console.picovoice.ai](https://console.picovoice.ai/))
-  — only the **extension's** wake-word mode needs this. The MCP server uses
-  [OpenWakeWord](https://github.com/dscripka/openWakeWord) instead, which needs
-  no key (see [Wake-word engines](#wake-word-engines)).
+  — only the **`antigravity-voice` extension's** wake-word mode needs this. The
+  MCP server has no wake-word; it's TTS plus on-demand `voice_confirm`.
+- **A speech engine on Linux** — `sudo apt install espeak-ng`. macOS and Windows
+  use built-in engines.
 
 ---
 
@@ -61,10 +65,12 @@ Optional, depending on features you enable:
 
 A lightweight MCP server exposing voice tools to Claude Desktop, the **Antigravity IDE**, and the **standalone Google Antigravity.app (Agentic)**:
 
-- `voice_listen` — record from the mic and transcribe with Whisper.
-- `voice_speak` — speak text aloud (local `say`, or Gemini TTS for longer replies).
-- `voice_toggle` — start/stop the server, toggle responses, check status.
-- `voice_check` — poll for wake-word-triggered transcriptions.
+- `voice_speak` — speak text aloud (native system voice, or Gemini 2.5 Flash
+  TTS for longer replies). Returns immediately; audio plays in the background.
+- `voice_confirm` — ask a quick spoken yes/no (≤5s, Whisper STT) and return
+  `yes`/`no`/`unclear` for hands-free approvals (e.g. "should I run this?").
+  Only proceed on `yes`.
+- `voice_toggle` — start/stop the server, toggle voice responses, check status.
 
 ### Setup and Deployment
 
@@ -136,16 +142,15 @@ To quickly control the server state, wake-words, or trigger manual recordings wi
 ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py
 ```
 This launches a native macOS **🎙 status bar icon** in the top right of your screen:
-- **Server: ON/OFF** — start or stop the active speech processing and mic pipeline.
-- **Wake Word: ON/OFF** — toggle hands-free wake word detection ("hey_jarvis", "alexa", etc.).
+- **Server: ON/OFF** — start or stop the voice server.
 - **Voice Response: ON/OFF** — mute/unmute spoken responses.
-- **Listen Now** — force one-shot recording and transcribing.
+- **Restart Server** — reload the server in place (picks up updated `server.py`).
 
 ##### Direct Agent Prompts
 You can also direct your AI assistant to control the voice engine by typing or saying:
 * *"Start the voice server."*
 * *"Mute voice responses."*
-* *"Toggle wake-word detection."*
+* *"Ask me to confirm before running that."* (uses `voice_confirm`)
 
 ---
 
@@ -155,10 +160,12 @@ Settings live in `~/.levity-voice/config.json` (created on first run). Notable k
 
 | Key | Default | Meaning |
 | :-- | :-- | :-- |
-| `whisper_model` | `base` | `tiny` / `base` / `small` / `medium` — accuracy vs speed. |
-| `local_voice` | `Samantha` | Any macOS voice (run `say -v '?'` to list). |
-| `gemini_api_key` | `""` | Set to enable cloud TTS. |
+| `whisper_model` | `base` | `tiny` / `base` / `small` / `medium` — accuracy vs speed (used by `voice_confirm`). |
+| `local_voice` | platform default | System voice name. macOS: `say -v '?'`; Windows: SAPI voice name; Linux: espeak voice. |
+| `gemini_api_key` | `""` | Set to enable cloud TTS (or use the `GEMINI_API_KEY` env var / `~/.levity-voice/.env`). |
 | `gemini_voice` | `Kore` | Gemini TTS persona. |
+
+Config changes are hot-reloaded — the running server picks them up without a restart.
 
 ---
 
@@ -200,17 +207,40 @@ npx vsce package
 
 ---
 
-## Wake-word engines
+## Wake word
 
-The two components use **different** wake-word backends — a deliberate trade-off:
-
-- **`levity-voice-mcp` → OpenWakeWord** — fully local, no account or key required.
-  Built-in keywords: `alexa`, `hey_mycroft`, `hey_jarvis`, `hey_rhasspy`.
-- **`antigravity-voice` → Picovoice Porcupine** — higher accuracy and more
-  built-in keywords, but requires a free Picovoice access key, and supports
-  custom `.ppn` keyword files trained at the Picovoice console.
+Wake-word activation lives only in the **`antigravity-voice` extension**, via
+**Picovoice Porcupine** (free access key, supports custom `.ppn` keywords). The
+`levity-voice-mcp` server is intentionally TTS plus on-demand `voice_confirm` —
+hands-free input there comes from your assistant's own voice input or
+`voice_confirm`, not an always-on wake word.
 
 ---
+
+## Guaranteed voice output
+
+You can make Levity speak **every** completed response, not just when the model
+remembers to. How strong that guarantee is depends on the runtime, because a
+true guarantee has to run when a turn ends — outside the model's control.
+
+| Runtime | Mechanism | Guarantee |
+| :-- | :-- | :-- |
+| **Claude Code / Cowork** | `Stop` hook (`levity-voice-mcp/hooks/`) — cross-platform | ✅ Every turn, unless muted or no TTS engine |
+| **Antigravity extension** | in-code `TTSProvider.speak()` after each turn | ✅ Every turn, unless muted |
+| **Claude Desktop** | model calls `voice_speak` | ⚠️ Best-effort — Desktop has no hook system |
+
+- **Claude Code / Cowork:** install the Stop hook (see
+  [`levity-voice-mcp/hooks/README.md`](./levity-voice-mcp/hooks/README.md)). It
+  reads the final assistant message and speaks it deterministically. A
+  `last_spoken.json` marker prevents double-speak when the model also voiced the
+  turn.
+- **Claude Desktop:** there is no post-turn hook, so spoken output relies on the
+  model calling `voice_speak` (the server's tool instructions strongly enforce
+  this). `voice_speak` now returns immediately and plays audio in the
+  background, so long replies no longer time out and silently drop.
+- **Mute anytime:** say "voice off" (runs `voice_toggle response_off`) or set
+  `response_active: false` in `~/.levity-voice/config.json`. Every mechanism
+  honors this switch.
 
 ## Privacy & security
 
@@ -222,23 +252,26 @@ The two components use **different** wake-word backends — a deliberate trade-o
 
 ---
 
-## Windows: coming soon
+## Platform notes
 
-Windows 11 support is in active development. The remaining work before it's
-functional:
+The MCP server detects the OS at startup (`platform.system()`) and routes TTS
+accordingly — no configuration needed:
 
-- **Local TTS** uses macOS `say`; needs a PowerShell `System.Speech` / SAPI shim.
-- **Cloud TTS playback** uses macOS `afplay`; needs a Windows audio player.
-- **Python discovery** assumes `python3` and a POSIX venv layout (`bin/python3`);
-  Windows uses `python` / the `py` launcher and `Scripts\python.exe`.
+- **Windows:** speech via PowerShell `System.Speech`; all subprocesses launch
+  with `CREATE_NO_WINDOW` so no console flashes. Self-restart uses
+  `Popen` + `os._exit` (since `os.execv` doesn't replace in place on Windows).
+- **Linux:** install a speech engine — `sudo apt install espeak-ng` — and an
+  audio player (`aplay`/`paplay`/`ffplay`, usually already present).
+- **macOS:** works out of the box.
 
-Until these land, run Levity on macOS. PRs adding the Windows shims are welcome.
+The older `antigravity-voice` VS Code extension has not yet been ported and
+remains macOS-focused.
 
 ---
 
 ## Roadmap
 
-- Cross-platform speech (Windows SAPI, Linux `espeak`/Piper).
+- Port the `antigravity-voice` extension to the cross-platform engine.
 - Fully offline AI tier (local LLM via Ollama for command interpretation).
 - Pinned dependency versions for reproducible installs.
 

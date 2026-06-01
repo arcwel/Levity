@@ -1,8 +1,16 @@
+# Levity Voice MCP — dependencies
+# Install:  pip install -r requirements.txt
+
+# MCP server framework (all platforms)
+mcp>=1.27
+
+# Speech-to-text for voice_confirm (all platforms). openai-whisper pulls in
+# torch; the numpy-array transcription path needs no system ffmpeg.
 openai-whisper
 sounddevice
 numpy
-openwakeword
-mcp
 
-# Optional: required only for the macOS menu-bar app (menubar.py).
-rumps; sys_platform == "darwin"
+# macOS menu-bar app (menubar.py) — macOS only.
+rumps>=0.4; sys_platform == "darwin"
+pyobjc-core>=12.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=12.0; sys_platform == "darwin"

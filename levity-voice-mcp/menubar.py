@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Levity Voice menu bar app — quick toggles for the MCP server.
+"""Levity Voice menu bar app — quick toggles for the MCP server (macOS).
 
 Communicates with the MCP server via two files in ~/.levity-voice/:
   - config.json   — status (read every 2s to refresh the menu)
   - command.json  — one-shot commands (written on user click; server deletes after)
+
+Supported commands match the cross-platform TTS server:
+  start, stop, response_on, response_off, restart.
 
 The menu bar app is its own process; quitting it does not stop the MCP server.
 """
@@ -23,7 +26,6 @@ LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL
 
 ICON_OFF = "🎙✕"
 ICON_IDLE = "🎙"
-ICON_WAKEWORD = "🎙•"
 
 POLL_INTERVAL_SEC = 2.0
 
@@ -76,19 +78,16 @@ class LevityVoiceApp(rumps.App):
         super().__init__(name="LevityVoice", title=ICON_OFF, quit_button=None)
 
         self.server_item = rumps.MenuItem("Server: OFF", callback=self.toggle_server)
-        self.wakeword_item = rumps.MenuItem("Wake Word: OFF", callback=self.toggle_wakeword)
         self.response_item = rumps.MenuItem("Voice Response: ON", callback=self.toggle_response)
-        self.listen_item = rumps.MenuItem("Listen Now", callback=self.listen_now)
+        self.restart_item = rumps.MenuItem("Restart Server", callback=self.restart_server)
         self.launch_item = rumps.MenuItem("Launch at Login", callback=self.toggle_launch_at_login)
         self.quit_item = rumps.MenuItem("Quit", callback=self.quit_app)
 
         self.menu = [
             self.server_item,
-            None,
-            self.wakeword_item,
             self.response_item,
             None,
-            self.listen_item,
+            self.restart_item,
             None,
             self.launch_item,
             None,
@@ -110,27 +109,17 @@ class LevityVoiceApp(rumps.App):
         self._last_cfg = cfg
 
         server = bool(cfg.get("server_active"))
-        wake = bool(cfg.get("wakeword_active"))
         resp = bool(cfg.get("response_active", True))
 
-        if not server:
-            self.title = ICON_OFF
-        elif wake:
-            self.title = ICON_WAKEWORD
-        else:
-            self.title = ICON_IDLE
+        self.title = ICON_IDLE if server else ICON_OFF
 
         self.server_item.title = f"Server: {'ON' if server else 'OFF'}"
         self.server_item.state = 1 if server else 0
 
-        self.wakeword_item.title = f"Wake Word: {'ON' if wake else 'OFF'}"
-        self.wakeword_item.state = 1 if wake else 0
-        self.wakeword_item.set_callback(self.toggle_wakeword if server else None)
-
         self.response_item.title = f"Voice Response: {'ON' if resp else 'OFF'}"
         self.response_item.state = 1 if resp else 0
 
-        self.listen_item.set_callback(self.listen_now if server else None)
+        self.restart_item.set_callback(self.restart_server if server else None)
 
         self.launch_item.state = 1 if LAUNCH_AGENT_PATH.exists() else 0
 
@@ -138,16 +127,12 @@ class LevityVoiceApp(rumps.App):
         cur = bool(self._last_cfg.get("server_active"))
         _write_command("stop" if cur else "start")
 
-    def toggle_wakeword(self, _sender) -> None:
-        cur = bool(self._last_cfg.get("wakeword_active"))
-        _write_command("wakeword_off" if cur else "wakeword_on")
-
     def toggle_response(self, _sender) -> None:
         cur = bool(self._last_cfg.get("response_active", True))
         _write_command("response_off" if cur else "response_on")
 
-    def listen_now(self, _sender) -> None:
-        _write_command("listen")
+    def restart_server(self, _sender) -> None:
+        _write_command("restart")
 
     def toggle_launch_at_login(self, _sender) -> None:
         if LAUNCH_AGENT_PATH.exists():
