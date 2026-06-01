@@ -1,0 +1,8 @@
+openai-whisper
+sounddevice
+numpy
+openwakeword
+mcp
+
+# Optional: required only for the macOS menu-bar app (menubar.py).
+rumps; sys_platform == "darwin"
