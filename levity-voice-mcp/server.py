@@ -49,6 +49,10 @@ from mcp.server.fastmcp import FastMCP
 # Section 1 — Platform detection, constants, logging, .env
 # ---------------------------------------------------------------------------
 
+# Build stamp — surfaced in voice_toggle("status") so you can confirm which
+# code the running process actually loaded (useful after a self-restart).
+BUILD = "2026-06-01.3-xplatform+confirm+ttsfix"
+
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
 IS_WINDOWS = PLATFORM == "Windows"
@@ -774,11 +778,29 @@ def _load_whisper():
     return _whisper_model
 
 
+def _wait_for_tts_idle(timeout: float = 30.0) -> None:
+    """Block until no TTS playback is active, so a spoken question finishes
+    before voice_confirm opens the mic (otherwise Whisper records the
+    assistant's own voice). Capped at `timeout` seconds."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _tts_proc_lock:
+            busy = _tts_process is not None
+        if not busy:
+            return
+        time.sleep(0.05)
+
+
 def _record_confirmation(window: float) -> str:
     """Record a short utterance (cap = window, early-stop on silence) and
     transcribe it with Whisper. Returns the transcript ('' if nothing)."""
     _ensure_audio()
     model = _load_whisper()
+
+    # Let any in-flight spoken question finish, then a short settle, so we
+    # don't capture our own TTS through the mic.
+    _wait_for_tts_idle()
+    time.sleep(0.15)
 
     frames: list = []
     state = {"last_voice": time.time(), "spoke": False, "start": time.time()}
@@ -1083,6 +1105,7 @@ async def voice_toggle(action: str) -> str:
                 "has_gemini_key": bool(snap.get("gemini_api_key")),
                 "whisper_model": snap.get("whisper_model", DEFAULT_WHISPER_MODEL),
                 "platform": PLATFORM,
+                "build": BUILD,
             }, indent=2)
         return await asyncio.to_thread(_get_status)
 
