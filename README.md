@@ -11,7 +11,7 @@ The project ships **two independent components** — use either or both:
 
 | Component | What it is | Use it when |
 | :-- | :-- | :-- |
-| [`levity-voice-mcp`](#1-levity-voice-mcp-claude-desktop) | An [MCP](https://modelcontextprotocol.io) server that gives **Claude Desktop** a voice. | You want to talk to Claude Desktop hands-free. |
+| [`levity-voice-mcp`](#1-levity-voice-mcp-claude-desktop-antigravity-ide-and-standalone-antigravityapp) | An [MCP](https://modelcontextprotocol.io) server that gives **Claude Desktop**, **Antigravity IDE**, and **standalone Google Antigravity.app (Agentic)** a voice. | You want to talk to your AI assistants hands-free. |
 | [`antigravity-voice`](#2-antigravity-voice-vs-code-extension) | A **VS Code / Antigravity** extension with its own STT, TTS, wake-word, and settings UI. | You want voice control inside your editor. |
 
 Both share the same design: **local-first, bring-your-own-key (BYOK), no telemetry.**
@@ -57,58 +57,97 @@ Optional, depending on features you enable:
 
 ---
 
-## 1. `levity-voice-mcp` (Claude Desktop)
+## 1. `levity-voice-mcp` (Claude Desktop, Antigravity IDE, and Standalone Antigravity.app)
 
-A lightweight MCP server exposing voice tools to Claude Desktop:
+A lightweight MCP server exposing voice tools to Claude Desktop, the **Antigravity IDE**, and the **standalone Google Antigravity.app (Agentic)**:
 
 - `voice_listen` — record from the mic and transcribe with Whisper.
 - `voice_speak` — speak text aloud (local `say`, or Gemini TTS for longer replies).
 - `voice_toggle` — start/stop the server, toggle responses, check status.
 - `voice_check` — poll for wake-word-triggered transcriptions.
 
-### Install (macOS, one-click)
+### Setup and Deployment
 
-1. In Finder, open the `levity-voice-mcp/` folder and **double-click `install.command`.**
-   It creates a virtual environment, installs dependencies, copies the server to
-   `~/.levity-voice/`, and registers itself in your Claude Desktop config.
-2. **Restart Claude Desktop.**
-3. In Claude, say or type: *"Start the voice server."*
+#### Step 1: Install & Create Virtual Environment
 
-### Install (manual / scripted)
+##### One-Click Install (macOS)
+In Finder, open the `levity-voice-mcp/` folder and **double-click `install.command`.**
+This will automatically create your local virtual environment, install dependencies, copy the server scripts to a stable path at `~/.levity-voice/`, and register the server inside your Claude Desktop configuration.
 
+##### Manual Setup (macOS/Linux Scripted)
+Or, perform a manual installation in your terminal:
 ```bash
 cd levity-voice-mcp
 ./setup.sh          # creates ~/.levity-voice/venv and installs deps
 ```
+*Note: This script copies `server.py` and `menubar.py` into your home directory under `~/.levity-voice/` for stable referencing.*
 
-`setup.sh` prints the exact JSON snippet to add to your Claude Desktop config at:
+#### Step 2: Register the MCP Server
 
-```
-~/Library/Application Support/Claude/claude_desktop_config.json
-```
+Depending on which environment(s) you use, copy the following configuration block into the corresponding config file:
 
+##### A. Claude Desktop
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
     "levity-voice": {
-      "command": "/Users/you/.levity-voice/venv/bin/python",
-      "args": ["/path/to/levity-voice-mcp/server.py"]
+      "command": "/Users/YOUR_USERNAME/.levity-voice/venv/bin/python",
+      "args": ["/Users/YOUR_USERNAME/.levity-voice/server.py"]
     }
   }
 }
 ```
 
-Restart Claude Desktop afterward.
+##### B. Antigravity IDE
+Add to `~/.gemini/antigravity-ide/mcp_config.json`:
+```json
+{
+  "mcpServers": {
+    "levity-voice": {
+      "command": "/Users/YOUR_USERNAME/.levity-voice/venv/bin/python",
+      "args": ["/Users/YOUR_USERNAME/.levity-voice/server.py"]
+    }
+  }
+}
+```
 
-### Optional: menu-bar app (macOS)
+##### C. Standalone Google Antigravity.app (Agentic)
+Add to `~/.gemini/antigravity/mcp_config.json`:
+```json
+{
+  "mcpServers": {
+    "levity-voice": {
+      "command": "/Users/YOUR_USERNAME/.levity-voice/venv/bin/python",
+      "args": ["/Users/YOUR_USERNAME/.levity-voice/server.py"]
+    }
+  }
+}
+```
+*(Make sure to replace `YOUR_USERNAME` with your actual macOS/Linux account name).*
 
-`menubar.py` adds a 🎙 menu-bar toggle for the server, wake-word, and voice
-responses. It requires [`rumps`](https://github.com/jaredks/rumps) (installed by
-the setup scripts via `requirements.txt`). Run it with the venv Python:
+#### Step 3: Run and Control the System
 
+Once registered, restart your respective application (Claude Desktop, Antigravity IDE, or Antigravity.app). 
+
+##### Interactive macOS Menu-Bar App
+To quickly control the server state, wake-words, or trigger manual recordings without typing commands:
 ```bash
 ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py
 ```
+This launches a native macOS **🎙 status bar icon** in the top right of your screen:
+- **Server: ON/OFF** — start or stop the active speech processing and mic pipeline.
+- **Wake Word: ON/OFF** — toggle hands-free wake word detection ("hey_jarvis", "alexa", etc.).
+- **Voice Response: ON/OFF** — mute/unmute spoken responses.
+- **Listen Now** — force one-shot recording and transcribing.
+
+##### Direct Agent Prompts
+You can also direct your AI assistant to control the voice engine by typing or saying:
+* *"Start the voice server."*
+* *"Mute voice responses."*
+* *"Toggle wake-word detection."*
+
+---
 
 ### Configuration
 
