@@ -147,12 +147,16 @@ Add to `~/.gemini/antigravity/mcp_config.json`:
 Once registered, restart your respective application (Claude Desktop, Antigravity IDE, or Antigravity.app). 
 
 ##### Interactive macOS Menu-Bar App
-On macOS the server **auto-launches the menu-bar app** when it starts (so the
-icon appears whenever Claude Desktop is running). Disable it by setting
-`auto_menubar: false` in `~/.levity-voice/config.json`. To start it manually:
+Launch the menu bar via **`Levity Voice.app`** (build it once with
+`build-app.command`, which installs it to `~/Applications`), or start it manually:
 ```bash
 ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py
 ```
+For it to start automatically, open the menu and click **"Launch at Login."**
+(The server can also auto-launch it on startup if you set `auto_menubar: true`
+in `~/.levity-voice/config.json`; it's **off by default** so you have a single
+launcher and the menu bar always starts in a proper GUI session.)
+
 This shows the **Levity status-bar icon** at the top-right of your screen:
 - **Response Mode** — choose **Quick (Yes/No)** or **Full (Free-form)** input.
 - **Server: ON/OFF** — start or stop the voice server.

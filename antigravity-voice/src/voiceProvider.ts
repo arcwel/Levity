@@ -9,9 +9,8 @@ import { GeminiService } from './geminiService';
  *   2. Process (Gemini text API — if key available)
  *   3. Respond (TTS — local `say` or Gemini TTS)
  *
- * Supports three trigger modes:
+ * Supports two trigger modes:
  *   - **tap**: press hotkey to start, press again to stop
- *   - **hold**: (planned — wired at keybinding level)
  *   - **wakeWord**: always-on Porcupine detection → auto-record
  */
 export class VoiceProvider {
@@ -141,7 +140,7 @@ export class VoiceProvider {
             if (!accessKey) {
                 vscode.window.showWarningMessage(
                     'Antigravity: Wake-word mode requires a Picovoice access key. ' +
-                    'Run "Antigravity: Set Picovoice Access Key" or switch to tap/hold mode.',
+                    'Run "Antigravity: Set Picovoice Access Key" or switch to tap mode.',
                 );
                 this.wakeWordActive = false;
                 this.setIdle();

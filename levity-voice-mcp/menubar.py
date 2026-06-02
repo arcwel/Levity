@@ -11,10 +11,12 @@ Supported commands match the cross-platform TTS server:
 The menu bar app is its own process; quitting it does not stop the MCP server.
 """
 
+import datetime
 import json
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import rumps
@@ -23,8 +25,17 @@ CONFIG_DIR = Path.home() / ".levity-voice"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
 MENUBAR_PID_FILE = CONFIG_DIR / "menubar.pid"
+MENUBAR_LOG = CONFIG_DIR / "menubar.log"
 # Optional custom status-bar icon (template PNG). Falls back to an emoji title.
 ICON_FILE = CONFIG_DIR / "levity-icon.png"
+
+
+def _log(msg: str) -> None:
+    try:
+        with open(MENUBAR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
 
 LAUNCH_AGENT_LABEL = "com.levity.voice.menubar"
 LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
@@ -79,16 +90,25 @@ def _launch_agent_plist() -> str:
 
 
 def _already_running() -> bool:
-    """Single-instance guard: True if another live menu-bar app is running."""
+    """Single-instance guard: True only if another *menu-bar* process is live.
+
+    Verifies the PID actually belongs to a menubar.py process (via `ps`) so a
+    reused/stale PID can't wrongly block startup.
+    """
     try:
         pid = int(MENUBAR_PID_FILE.read_text().strip())
     except (OSError, ValueError):
         pid = 0
     if pid and pid != os.getpid():
         try:
-            os.kill(pid, 0)
-            return True  # a live instance owns the PID
-        except (ProcessLookupError, PermissionError):
+            os.kill(pid, 0)  # exists?
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            if "menubar.py" in out:
+                return True  # a real, live menu-bar instance
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
             pass
     try:
         MENUBAR_PID_FILE.write_text(str(os.getpid()))
@@ -97,11 +117,24 @@ def _already_running() -> bool:
     return False
 
 
+def _hide_dock_icon() -> None:
+    """Run as a menu-bar accessory (no Dock icon / no Python rocket)."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+        _log("hide_dock_icon: set accessory policy OK")
+    except Exception as exc:
+        _log(f"hide_dock_icon: FAILED {exc!r}")
+
+
 class LevityVoiceApp(rumps.App):
     def __init__(self):
         # Use the Levity logo as a template status-bar icon if present;
         # otherwise fall back to the emoji title.
         icon = str(ICON_FILE) if ICON_FILE.exists() else None
+        # Logo-only when the icon is present; fall back to an emoji title if not.
         super().__init__(
             name="LevityVoice",
             title=None if icon else ICON_OFF,
@@ -157,6 +190,7 @@ class LevityVoiceApp(rumps.App):
         resp = bool(cfg.get("response_active", True))
         mode = cfg.get("listen_mode", "quick")
 
+        # Without a custom icon, show server state via an emoji title.
         if not self._has_icon:
             self.title = ICON_IDLE if server else ICON_OFF
 
@@ -226,6 +260,21 @@ class LevityVoiceApp(rumps.App):
 
 
 if __name__ == "__main__":
-    if _already_running():
-        sys.exit(0)  # another menu-bar instance is already up
-    LevityVoiceApp().run()
+    _log(f"=== menubar starting (pid {os.getpid()}, python {sys.executable}) ===")
+    try:
+        if _already_running():
+            _log("another instance already running -> exiting")
+            sys.exit(0)
+        _log(f"icon file exists: {ICON_FILE.exists()}")
+        _hide_dock_icon()
+        app = LevityVoiceApp()
+        _log("LevityVoiceApp constructed OK")
+        _hide_dock_icon()  # re-assert after rumps initializes NSApplication
+        _log("entering rumps run loop")
+        app.run()
+        _log("run loop returned")
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        _log("CRASH: " + repr(exc) + "\n" + traceback.format_exc())
+        raise

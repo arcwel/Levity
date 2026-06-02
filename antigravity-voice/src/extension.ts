@@ -8,8 +8,6 @@ import { SettingsPanel } from './settingsPanel';
 let sidecarManager: SidecarManager | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-    console.log('Antigravity Voice extension is now active!');
-
     // Boot the Python sidecar eagerly so Whisper is preloaded before the user
     // issues their first voice command.
     sidecarManager = new SidecarManager(context.extensionPath);

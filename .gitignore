@@ -2,6 +2,9 @@
 .DS_Store
 Thumbs.db
 
+# ---- Binary docs superseded by markdown READMEs ----
+*.docx
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
@@ -35,3 +38,9 @@ command.json
 # never in the repo. This is a safety net.
 .env
 *.key
+
+# ---- Built macOS app bundle (use build-app.command to regenerate) ----
+*.app/
+
+# scratch icon preview
+**/_icon_preview.png
