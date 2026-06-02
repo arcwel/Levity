@@ -24,6 +24,8 @@ echo "==> Copying server.py to $CONFIG_DIR"
 cp "$SCRIPT_DIR/server.py" "$CONFIG_DIR/server.py"
 # Menu-bar app (optional) and the Claude Code Stop hook.
 [ -f "$SCRIPT_DIR/menubar.py" ] && cp "$SCRIPT_DIR/menubar.py" "$CONFIG_DIR/menubar.py"
+# Menu-bar status icon (template PNG).
+[ -f "$SCRIPT_DIR/assets/levity-icon.png" ] && cp "$SCRIPT_DIR/assets/levity-icon.png" "$CONFIG_DIR/levity-icon.png"
 if [ -d "$SCRIPT_DIR/hooks" ]; then
     mkdir -p "$CONFIG_DIR/hooks"
     cp "$SCRIPT_DIR/hooks/"*.py "$CONFIG_DIR/hooks/" 2>/dev/null || true

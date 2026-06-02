@@ -6,13 +6,15 @@ Communicates with the MCP server via two files in ~/.levity-voice/:
   - command.json  — one-shot commands (written on user click; server deletes after)
 
 Supported commands match the cross-platform TTS server:
-  start, stop, response_on, response_off, restart.
+  start, stop, response_on, response_off, restart, mode_quick, mode_full.
 
 The menu bar app is its own process; quitting it does not stop the MCP server.
 """
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import rumps
@@ -20,6 +22,9 @@ import rumps
 CONFIG_DIR = Path.home() / ".levity-voice"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 COMMAND_FILE = CONFIG_DIR / "command.json"
+MENUBAR_PID_FILE = CONFIG_DIR / "menubar.pid"
+# Optional custom status-bar icon (template PNG). Falls back to an emoji title.
+ICON_FILE = CONFIG_DIR / "levity-icon.png"
 
 LAUNCH_AGENT_LABEL = "com.levity.voice.menubar"
 LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
@@ -73,9 +78,45 @@ def _launch_agent_plist() -> str:
     )
 
 
+def _already_running() -> bool:
+    """Single-instance guard: True if another live menu-bar app is running."""
+    try:
+        pid = int(MENUBAR_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid and pid != os.getpid():
+        try:
+            os.kill(pid, 0)
+            return True  # a live instance owns the PID
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        MENUBAR_PID_FILE.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    return False
+
+
 class LevityVoiceApp(rumps.App):
     def __init__(self):
-        super().__init__(name="LevityVoice", title=ICON_OFF, quit_button=None)
+        # Use the Levity logo as a template status-bar icon if present;
+        # otherwise fall back to the emoji title.
+        icon = str(ICON_FILE) if ICON_FILE.exists() else None
+        super().__init__(
+            name="LevityVoice",
+            title=None if icon else ICON_OFF,
+            icon=icon,
+            template=True,
+            quit_button=None,
+        )
+        self._has_icon = icon is not None
+
+        # Response Mode (at the top): Quick = yes/no, Full = free-form transcript.
+        # Two top-level checkable items (more reliable than a submenu in rumps),
+        # under a disabled header that acts as the section label.
+        self.mode_header = rumps.MenuItem("Response Mode")  # no callback = header
+        self.mode_quick_item = rumps.MenuItem("  Quick (Yes / No)", callback=self.set_mode_quick)
+        self.mode_full_item = rumps.MenuItem("  Full (Free-form)", callback=self.set_mode_full)
 
         self.server_item = rumps.MenuItem("Server: OFF", callback=self.toggle_server)
         self.response_item = rumps.MenuItem("Voice Response: ON", callback=self.toggle_response)
@@ -84,6 +125,10 @@ class LevityVoiceApp(rumps.App):
         self.quit_item = rumps.MenuItem("Quit", callback=self.quit_app)
 
         self.menu = [
+            self.mode_header,
+            self.mode_quick_item,
+            self.mode_full_item,
+            None,
             self.server_item,
             self.response_item,
             None,
@@ -110,8 +155,14 @@ class LevityVoiceApp(rumps.App):
 
         server = bool(cfg.get("server_active"))
         resp = bool(cfg.get("response_active", True))
+        mode = cfg.get("listen_mode", "quick")
 
-        self.title = ICON_IDLE if server else ICON_OFF
+        if not self._has_icon:
+            self.title = ICON_IDLE if server else ICON_OFF
+
+        # Reflect the current response mode (radio-style checkmarks).
+        self.mode_quick_item.state = 1 if mode == "quick" else 0
+        self.mode_full_item.state = 1 if mode == "full" else 0
 
         self.server_item.title = f"Server: {'ON' if server else 'OFF'}"
         self.server_item.state = 1 if server else 0
@@ -133,6 +184,19 @@ class LevityVoiceApp(rumps.App):
 
     def restart_server(self, _sender) -> None:
         _write_command("restart")
+
+    def set_mode_quick(self, _sender) -> None:
+        _write_command("mode_quick")
+        # Optimistic UI update so the checkmark moves instantly.
+        self.mode_quick_item.state = 1
+        self.mode_full_item.state = 0
+        self._last_cfg = {}  # force a real refresh on next tick
+
+    def set_mode_full(self, _sender) -> None:
+        _write_command("mode_full")
+        self.mode_quick_item.state = 0
+        self.mode_full_item.state = 1
+        self._last_cfg = {}
 
     def toggle_launch_at_login(self, _sender) -> None:
         if LAUNCH_AGENT_PATH.exists():
@@ -162,4 +226,6 @@ class LevityVoiceApp(rumps.App):
 
 
 if __name__ == "__main__":
+    if _already_running():
+        sys.exit(0)  # another menu-bar instance is already up
     LevityVoiceApp().run()

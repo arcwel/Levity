@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="levity-voice-mcp/assets/levity-appicon-256.png" alt="Levity" width="128" height="128">
+</p>
+
 # Levity
 
 **Voice-driven AI development — talk to your coding assistant and hear it talk back.**
@@ -67,10 +71,16 @@ A lightweight MCP server exposing voice tools to Claude Desktop, the **Antigravi
 
 - `voice_speak` — speak text aloud (native system voice, or Gemini 2.5 Flash
   TTS for longer replies). Returns immediately; audio plays in the background.
-- `voice_confirm` — ask a quick spoken yes/no (≤5s, Whisper STT) and return
-  `yes`/`no`/`unclear` for hands-free approvals (e.g. "should I run this?").
-  Only proceed on `yes`.
-- `voice_toggle` — start/stop the server, toggle voice responses, check status.
+- `voice_confirm` — **quick** spoken yes/no (≤5s, Whisper STT) → `yes`/`no`/`unclear`
+  for hands-free approvals (e.g. "should I run this?"). Only proceed on `yes`.
+- `voice_listen` — **full** free-form listening (up to 30s, Whisper STT) → returns
+  the raw transcript, so you can answer anything ("let's go with option A").
+- `voice_toggle` — start/stop the server, toggle voice responses, set listen mode,
+  check status.
+
+**Response modes.** A `listen_mode` preference (`quick` or `full`) — toggled from
+the menu bar's **Response Mode** item — tells the assistant which style you prefer:
+`quick` favors `voice_confirm` (yes/no), `full` favors `voice_listen` (free-form).
 
 ### Setup and Deployment
 
@@ -137,11 +147,14 @@ Add to `~/.gemini/antigravity/mcp_config.json`:
 Once registered, restart your respective application (Claude Desktop, Antigravity IDE, or Antigravity.app). 
 
 ##### Interactive macOS Menu-Bar App
-To quickly control the server state, wake-words, or trigger manual recordings without typing commands:
+On macOS the server **auto-launches the menu-bar app** when it starts (so the
+icon appears whenever Claude Desktop is running). Disable it by setting
+`auto_menubar: false` in `~/.levity-voice/config.json`. To start it manually:
 ```bash
 ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py
 ```
-This launches a native macOS **🎙 status bar icon** in the top right of your screen:
+This shows the **Levity status-bar icon** at the top-right of your screen:
+- **Response Mode** — choose **Quick (Yes/No)** or **Full (Free-form)** input.
 - **Server: ON/OFF** — start or stop the voice server.
 - **Voice Response: ON/OFF** — mute/unmute spoken responses.
 - **Restart Server** — reload the server in place (picks up updated `server.py`).
@@ -160,7 +173,8 @@ Settings live in `~/.levity-voice/config.json` (created on first run). Notable k
 
 | Key | Default | Meaning |
 | :-- | :-- | :-- |
-| `whisper_model` | `base` | `tiny` / `base` / `small` / `medium` — accuracy vs speed (used by `voice_confirm`). |
+| `whisper_model` | `base` | `tiny` / `base` / `small` / `medium` — accuracy vs speed (used by `voice_confirm`/`voice_listen`). |
+| `listen_mode` | `quick` | `quick` (yes/no) or `full` (free-form). Set from the menu bar. |
 | `local_voice` | platform default | System voice name. macOS: `say -v '?'`; Windows: SAPI voice name; Linux: espeak voice. |
 | `gemini_api_key` | `""` | Set to enable cloud TTS (or use the `GEMINI_API_KEY` env var / `~/.levity-voice/.env`). |
 | `gemini_voice` | `Kore` | Gemini TTS persona. |
@@ -214,6 +228,20 @@ Wake-word activation lives only in the **`antigravity-voice` extension**, via
 `levity-voice-mcp` server is intentionally TTS plus on-demand `voice_confirm` —
 hands-free input there comes from your assistant's own voice input or
 `voice_confirm`, not an always-on wake word.
+
+---
+
+## Voice input & dictation
+
+Levity captures your spoken answers with its **own Whisper engine**
+(`voice_confirm` / `voice_listen`) — it does **not** depend on any third-party
+dictation app (e.g. Dictaflow) or on macOS Dictation. Nothing extra is required
+for Levity's voice features to work.
+
+If you also like to **dictate your typed chat messages**, that's separate from
+Levity: use whatever you prefer. If you don't have a tool like Dictaflow, macOS
+**Dictation** is built in (System Settings → Keyboard → Dictation) and works out
+of the box — Levity neither requires nor manages it.
 
 ---
 
