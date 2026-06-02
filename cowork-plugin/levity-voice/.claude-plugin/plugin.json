@@ -1,0 +1,8 @@
+{
+  "name": "levity-voice",
+  "version": "0.1.0",
+  "description": "Hands-free voice for your AI assistant — speak replies aloud and capture spoken yes/no or free-form answers via the Levity voice server.",
+  "author": { "name": "Anthony Guidry" },
+  "license": "MIT",
+  "keywords": ["voice", "tts", "speech-to-text", "whisper", "accessibility", "hands-free"]
+}

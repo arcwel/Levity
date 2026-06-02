@@ -147,15 +147,19 @@ Add to `~/.gemini/antigravity/mcp_config.json`:
 Once registered, restart your respective application (Claude Desktop, Antigravity IDE, or Antigravity.app). 
 
 ##### Interactive macOS Menu-Bar App
-Launch the menu bar via **`Levity Voice.app`** (build it once with
-`build-app.command`, which installs it to `~/Applications`), or start it manually:
+The server **launches the menu bar automatically** (macOS) — whenever the voice
+server starts (host launch, or when you start the voice service) the 🎙 Levity
+icon appears. A single-instance guard prevents duplicate icons across Claude
+Desktop / Antigravity. Disable with `"auto_menubar": false` in
+`~/.levity-voice/config.json`.
+
+To start it by hand (e.g. before the server runs):
 ```bash
 ~/.levity-voice/venv/bin/python ~/.levity-voice/menubar.py
 ```
-For it to start automatically, open the menu and click **"Launch at Login."**
-(The server can also auto-launch it on startup if you set `auto_menubar: true`
-in `~/.levity-voice/config.json`; it's **off by default** so you have a single
-launcher and the menu bar always starts in a proper GUI session.)
+For a Login Item, click **"Launch at Login"** in the menu. (An optional
+double-click app can be built with `build-app.command`, but the automatic
+launch above is the recommended path.)
 
 This shows the **Levity status-bar icon** at the top-right of your screen:
 - **Response Mode** — choose **Quick (Yes/No)** or **Full (Free-form)** input.
@@ -274,6 +278,21 @@ true guarantee has to run when a turn ends — outside the model's control.
   `response_active: false` in `~/.levity-voice/config.json`. Every mechanism
   honors this switch.
 
+## Skill & Cowork plugin
+
+- **Skill** (`levity-voice-mcp/skill/SKILL.md`) — lets the assistant start and
+  drive the voice loop on command ("start voice"). Installed for Antigravity
+  under `~/.gemini/config/skills` and `global_skills`.
+- **Cowork plugin** (`cowork-plugin/levity-voice/`) — packages that skill for
+  Claude Desktop's plugin system; build a `.plugin` to install it there. It's
+  skill-only (it uses your existing `levity-voice` MCP rather than adding a
+  second server).
+
+Levity currently runs as a **single active voice server** — one host at a time
+(a PID lock prevents multiple processes fighting over the mic). Running it across
+**multiple hosts simultaneously** is designed in
+[`docs/multi-host-voice-daemon.md`](./docs/multi-host-voice-daemon.md).
+
 ## Privacy & security
 
 - **Speech-to-text runs locally** (Whisper) — your audio is not sent anywhere
@@ -303,6 +322,9 @@ remains macOS-focused.
 
 ## Roadmap
 
+- **Multi-host voice daemon** — run Levity in Claude Desktop + Antigravity
+  simultaneously via a shared daemon + per-host shims
+  ([design](./docs/multi-host-voice-daemon.md)).
 - Port the `antigravity-voice` extension to the cross-platform engine.
 - Fully offline AI tier (local LLM via Ollama for command interpretation).
 - Pinned dependency versions for reproducible installs.

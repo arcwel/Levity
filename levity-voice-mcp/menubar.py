@@ -260,7 +260,12 @@ class LevityVoiceApp(rumps.App):
 
 
 if __name__ == "__main__":
-    _log(f"=== menubar starting (pid {os.getpid()}, python {sys.executable}) ===")
+    try:
+        _tty = sys.stdin.isatty()
+    except Exception:
+        _tty = False
+    _log(f"=== menubar starting (pid {os.getpid()}, ppid {os.getppid()}, "
+         f"tty={_tty}, launched-by={'terminal' if _tty else 'app/agent'}) ===")
     try:
         if _already_running():
             _log("another instance already running -> exiting")

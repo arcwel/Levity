@@ -3,29 +3,37 @@
 # Double-click in Finder, or run:  bash build-app.command
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC_ICNS="$SCRIPT_DIR/levity-voice-mcp/assets/levity.icns"
 APPICON="$SCRIPT_DIR/levity-voice-mcp/assets/levity-appicon.png"
 APP="$HOME/Applications/Levity Voice.app"
-PY="$HOME/.levity-voice/venv/bin/python"; command -v "$PY" >/dev/null 2>&1 || PY="python3"
 
-echo "==> Generating icon..."
-"$PY" - "$APPICON" /tmp/levity.icns <<'PY'
+echo "==> Assembling app bundle at: $APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+echo "==> Preparing icon..."
+if [ -f "$SRC_ICNS" ]; then
+    cp "$SRC_ICNS" "$APP/Contents/Resources/levity.icns"        # prebuilt, no deps
+else
+    PY="$HOME/.levity-voice/venv/bin/python"; command -v "$PY" >/dev/null 2>&1 || PY="python3"
+    "$PY" - "$APPICON" "$APP/Contents/Resources/levity.icns" <<'PY'
 import sys
 from PIL import Image
 Image.open(sys.argv[1]).convert("RGBA").resize((1024,1024)).save(sys.argv[2], format="ICNS")
 PY
-
-echo "==> Assembling app bundle at: $APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp /tmp/levity.icns "$APP/Contents/Resources/levity.icns"
+fi
 cat > "$APP/Contents/MacOS/LevityVoice" <<'LAUNCH'
 #!/bin/bash
+# Start the menu-bar controller DETACHED (not `exec`) — running python as the
+# app bundle's main process breaks the menu-bar status item; a detached child
+# (like `nohup ... &`) renders correctly.
 PY="$HOME/.levity-voice/venv/bin/python"
 SCRIPT="$HOME/.levity-voice/menubar.py"
 if [ ! -x "$PY" ] || [ ! -f "$SCRIPT" ]; then
   osascript -e 'display alert "Levity Voice" message "Levity is not installed yet. Run install.command first."'
   exit 1
 fi
-exec "$PY" "$SCRIPT"
+nohup "$PY" "$SCRIPT" >/dev/null 2>&1 &
+exit 0
 LAUNCH
 chmod +x "$APP/Contents/MacOS/LevityVoice"
 cat > "$APP/Contents/Info.plist" <<'PLIST'

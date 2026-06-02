@@ -51,7 +51,7 @@ from mcp.server.fastmcp import FastMCP
 
 # Build stamp — surfaced in voice_toggle("status") so you can confirm which
 # code the running process actually loaded (useful after a self-restart).
-BUILD = "2026-06-01.6-menubar-launch-fixes"
+BUILD = "2026-06-02.7-server-launches-menubar"
 
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
@@ -319,10 +319,10 @@ _CONFIG_SCHEMA = {
     "gemini_voice":    (str,  DEFAULT_GEMINI_VOICE),
     "whisper_model":   (str,  DEFAULT_WHISPER_MODEL),
     "listen_mode":     (str,  "quick"),
-    # Off by default: the menu bar is owned by the app / Login Item, so the
-    # server doesn't also spawn one (avoids two launchers fighting the lock).
-    # Set true to have the server auto-launch the menu bar on startup (macOS).
-    "auto_menubar":    (bool, False),
+    # On by default: the server launches the macOS menu bar itself (direct
+    # Python — the reliable method). A single-instance guard prevents duplicate
+    # icons across hosts. Set false to suppress it.
+    "auto_menubar":    (bool, True),
 }
 
 
@@ -1099,12 +1099,14 @@ def _apply_toggle_action(action: str) -> str:
     """Synchronous toggle logic. Acquires _lock once, releases, then does I/O."""
     if action == "start":
         with _lock:
-            if _config.get("server_active"):
-                return "Server is already active."
+            already = _config.get("server_active")
             _config["server_active"] = True
             snapshot = dict(_config)
-        _save_config(snapshot)
-        return "Voice server started (TTS-only mode)."
+        if not already:
+            _save_config(snapshot)
+        # Bring up the menu bar too (idempotent: skipped if already running).
+        _maybe_launch_menubar()
+        return "Server is already active." if already else "Voice server started."
 
     if action == "stop":
         _kill_active_tts()
@@ -1180,7 +1182,7 @@ async def voice_toggle(action: str) -> str:
                 "has_gemini_key": bool(snap.get("gemini_api_key")),
                 "whisper_model": snap.get("whisper_model", DEFAULT_WHISPER_MODEL),
                 "listen_mode": snap.get("listen_mode", "quick"),
-                "auto_menubar": snap.get("auto_menubar", False),
+                "auto_menubar": snap.get("auto_menubar", True),
                 "platform": PLATFORM,
                 "build": BUILD,
             }, indent=2)
@@ -1361,30 +1363,34 @@ def _maybe_launch_menubar() -> None:
     running (pgrep) so multiple server instances don't spawn duplicate icons.
     """
     if not IS_MACOS:
+        log.info("menu-bar: skipped (not macOS)")
         return
-    if not _get_config_snapshot().get("auto_menubar", False):
+    if not _get_config_snapshot().get("auto_menubar", True):
+        log.info("menu-bar: skipped (auto_menubar off)")
         return
     menubar = CONFIG_DIR / "menubar.py"
     if not menubar.exists():
+        log.warning("menu-bar: skipped (menubar.py not found at %s)", menubar)
         return
     try:
         existing = subprocess.run(
             ["pgrep", "-f", str(menubar)], capture_output=True, text=True, timeout=5,
         )
         if existing.stdout.strip():
-            log.info("menu-bar app already running; not launching another")
+            log.info("menu-bar: already running (pids %s); not launching",
+                     existing.stdout.split())
             return
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, str(menubar)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        log.info("launched menu-bar app")
+        log.info("menu-bar: launched via %s (child pid %d)", sys.executable, proc.pid)
     except OSError as exc:
-        log.error("menu-bar launch failed: %r", exc)
+        log.error("menu-bar: launch failed: %r", exc)
 
 
 def _graceful_shutdown(signum, _frame):
