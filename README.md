@@ -333,4 +333,4 @@ remains macOS-focused.
 
 ## License
 
-[MIT](./LICENSE) © 2026 Anthony Guidry
+[MIT](./LICENSE) © 2026 Arcwel

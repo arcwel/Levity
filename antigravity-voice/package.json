@@ -4,10 +4,10 @@
   "description": "Voice-Driven AI Development Service",
   "version": "0.2.0",
   "license": "MIT",
-  "author": "Anthony Guidry",
+  "author": "Arcwel",
   "repository": {
     "type": "git",
-    "url": "https://github.com/A-Guidry/levity"
+    "url": "https://github.com/arcwel/Levity"
   },
   "engines": {
     "vscode": "^1.80.0"
