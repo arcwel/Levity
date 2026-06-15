@@ -53,6 +53,10 @@ from mcp.server.fastmcp import FastMCP
 # code the running process actually loaded (useful after a self-restart).
 BUILD = "2026-06-02.7-server-launches-menubar"
 
+# Wall-clock time the process booted; surfaced as "uptime" in
+# voice_toggle("status"). Set at import (i.e. process start).
+_server_started_at = time.time()
+
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
 IS_WINDOWS = PLATFORM == "Windows"
@@ -1184,6 +1188,19 @@ def _apply_toggle_action(action: str) -> str:
     )
 
 
+def _format_uptime() -> str:
+    """Uptime as days rounded to the nearest half day, e.g. "1.5 days".
+
+    Uses "day" only for exactly 1, "days" otherwise (incl. 0.5).
+    """
+    days = (time.time() - _server_started_at) / 86400.0
+    half_days = round(days * 2) / 2  # nearest 0.5
+    unit = "day" if half_days == 1 else "days"
+    # Drop the trailing ".0" so whole numbers read "2 days" not "2.0 days".
+    value = int(half_days) if half_days == int(half_days) else half_days
+    return f"{value} {unit}"
+
+
 @mcp.tool(
     name="voice_toggle",
     annotations={
@@ -1226,6 +1243,7 @@ async def voice_toggle(action: str) -> str:
                 "auto_menubar": snap.get("auto_menubar", True),
                 "platform": PLATFORM,
                 "build": BUILD,
+                "uptime": _format_uptime(),
             }, indent=2)
         return await asyncio.to_thread(_get_status)
 
