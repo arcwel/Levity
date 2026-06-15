@@ -57,6 +57,10 @@ BUILD = "2026-06-02.7-server-launches-menubar"
 # voice_toggle("status"). Set at import (i.e. process start).
 _server_started_at = time.time()
 
+# Auto-restart ceiling: a process running longer than this re-execs itself to
+# refresh (long-lived TTS/audio state can drift over many days). Tune freely.
+MAX_UPTIME_SECONDS = 5 * 24 * 3600  # 5 days
+
 PLATFORM = platform.system()  # "Darwin", "Windows", or "Linux"
 IS_MACOS = PLATFORM == "Darwin"
 IS_WINDOWS = PLATFORM == "Windows"
@@ -1415,6 +1419,33 @@ def _auto_restore() -> None:
         log.error("auto-restore failed: %r", exc)
 
 
+def _uptime_watchdog() -> None:
+    """Re-exec the process once uptime exceeds MAX_UPTIME_SECONDS.
+
+    Long-running daemons accumulate audio/TTS state drift; a periodic fresh
+    start keeps things healthy. Polls hourly; once over the ceiling it cleans
+    up (removes our PID file, kills any in-flight TTS) and replaces the process
+    in place via os.execv so the menu bar / MCP transport sees a seamless
+    restart.
+    """
+    while not _shutdown_flag:
+        time.sleep(3600)  # check hourly
+        if _shutdown_flag:
+            return
+        try:
+            if time.time() - _server_started_at > MAX_UPTIME_SECONDS:
+                log.info("Auto-restart: uptime exceeded 5 days, restarting...")
+                for handler in log.handlers:
+                    handler.flush()
+                # Clean up before handing the slot to the fresh process.
+                _remove_pid_file()
+                _kill_active_tts()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                return  # os.execv replaces the image; defensively stop anyway
+        except Exception as exc:
+            log.error("uptime watchdog failed: %r", exc)
+
+
 def _maybe_launch_menubar() -> None:
     """Launch the macOS menu-bar app on startup (opt-in via auto_menubar).
 
@@ -1480,6 +1511,9 @@ if __name__ == "__main__":
     _start_command_watcher()
     threading.Thread(
         target=_auto_restore, daemon=True, name="levity-auto-restore"
+    ).start()
+    threading.Thread(
+        target=_uptime_watchdog, daemon=True, name="levity-uptime-watchdog"
     ).start()
     _maybe_launch_menubar()
 
