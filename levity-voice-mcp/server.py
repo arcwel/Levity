@@ -431,6 +431,15 @@ _tts_lock = threading.RLock()       # serializes playback (RLock for fallback)
 _tts_process: subprocess.Popen | None = None
 _tts_proc_lock = threading.Lock()   # guards _tts_process reference
 
+# Monotonic counter bumped by every voice_speak. A background speak thread
+# checks it after acquiring _tts_lock and bails if a newer call has arrived,
+# so a request that lost the interrupt race (its predecessor hadn't yet
+# registered its subprocess when _kill_active_tts ran) can't replay stale
+# audio after the newest utterance. Leaf lock: never held while acquiring
+# another lock.
+_speak_gen = 0
+_speak_gen_lock = threading.Lock()
+
 
 def _kill_active_tts() -> None:
     """Terminate any in-flight TTS subprocess."""
@@ -519,6 +528,12 @@ def _speak_local(text: str, voice: str | None = None) -> str:
 def _speak_local_macos(text: str, voice: str) -> str:
     proc = _run_tts_subprocess(["say", "-v", voice], text_input=text)
     if proc.returncode != 0:
+        # A negative return code means `say` was killed by a signal — i.e. we
+        # interrupted it (SIGTERM) to start a newer utterance (interrupt /
+        # newest-wins). That is NOT a failure: re-speaking the cut-off text on
+        # the default voice would replay what we just silenced. Bail quietly.
+        if proc.returncode < 0:
+            return "Interrupted."
         log.warning("say -v %s failed (rc=%d), trying default", voice, proc.returncode)
         fallback = _run_tts_subprocess(["say"], text_input=text)
         if fallback.returncode != 0:
@@ -654,7 +669,9 @@ def _speak_gemini(text: str, api_key: str, gemini_voice: str,
             if b64:
                 audio_b64 = b64
                 break
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        # AttributeError covers a candidate/part that isn't the dict we expect
+        # (e.g. a string), so a malformed response still falls back cleanly.
         log.error("Gemini parse error: %r", exc)
 
     if not audio_b64:
@@ -710,15 +727,26 @@ def _write_last_spoken(text: str) -> None:
 
 
 def _speak_background(text: str, use_cloud: bool, api_key: str,
-                      gemini_voice: str, local_voice: str) -> None:
+                      gemini_voice: str, local_voice: str,
+                      generation: int) -> None:
     """Run the (blocking) TTS in a background thread so voice_speak can return
     immediately — long replies must not keep the MCP request open long enough
-    to time out and silently drop the audio."""
+    to time out and silently drop the audio.
+
+    `generation` is the voice_speak sequence number this thread belongs to. We
+    serialize on _tts_lock and, once it's ours, bail if a newer voice_speak has
+    since arrived — that thread will speak instead, so we never replay audio
+    the user has already superseded."""
     try:
-        if use_cloud:
-            _speak_gemini(text, api_key, gemini_voice, local_voice)
-        else:
-            _speak_local(text, local_voice)
+        with _tts_lock:
+            with _speak_gen_lock:
+                superseded = generation != _speak_gen
+            if superseded:
+                return
+            if use_cloud:
+                _speak_gemini(text, api_key, gemini_voice, local_voice)
+            else:
+                _speak_local(text, local_voice)
     except Exception as exc:
         log.error("background speak failed: %r", exc)
 
@@ -825,24 +853,29 @@ def _record_audio(window: float, silence_sec: float) -> str:
                 state["last_voice"] = time.time()
                 state["spoke"] = True
 
+    # Keep fd 1 muted for the ENTIRE time the PortAudio stream is live, not
+    # just around start/stop. CoreAudio (PaMacCore / AUHAL) can write
+    # diagnostics straight to fd 1 from its own thread at any point during
+    # capture, and a single stray byte mid-recording corrupts the stdio
+    # JSON-RPC stream (e.g. `Unexpected token '|', "||PaMacCor"...`), which
+    # disconnects the MCP server.
     with _silence_fd1():
         stream = _sd.InputStream(
             samplerate=MIC_SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=MIC_BLOCK_SIZE, callback=_cb,
         )
         stream.start()
-    try:
-        while True:
-            time.sleep(0.05)
-            now = time.time()
-            with cb_lock:
-                elapsed = now - state["start"]
-                silence = (now - state["last_voice"]) if state["spoke"] else 0.0
-                spoke = state["spoke"]
-            if elapsed >= window or (spoke and silence >= silence_sec):
-                break
-    finally:
-        with _silence_fd1():
+        try:
+            while True:
+                time.sleep(0.05)
+                now = time.time()
+                with cb_lock:
+                    elapsed = now - state["start"]
+                    silence = (now - state["last_voice"]) if state["spoke"] else 0.0
+                    spoke = state["spoke"]
+                if elapsed >= window or (spoke and silence >= silence_sec):
+                    break
+        finally:
             try:
                 stream.stop()
                 stream.close()
@@ -963,13 +996,19 @@ async def voice_speak(text: str, force_local: bool = False) -> str:
     # already voiced even while audio is still playing.
     _write_last_spoken(text)
 
-    # Interrupt any in-flight speech, then play in the BACKGROUND and return
-    # right away. Blocking until `say`/Gemini finished reading a long reply is
-    # what made the MCP request time out and silently drop the spoken response.
+    # Claim the newest-utterance slot, then interrupt any in-flight speech and
+    # play in the BACKGROUND, returning right away. Blocking until `say`/Gemini
+    # finished reading a long reply is what made the MCP request time out and
+    # silently drop the spoken response. The generation tag lets the background
+    # thread bail if an even newer voice_speak arrives before it gets the lock.
+    global _speak_gen
+    with _speak_gen_lock:
+        _speak_gen += 1
+        my_gen = _speak_gen
     _kill_active_tts()
     threading.Thread(
         target=_speak_background,
-        args=(text, use_cloud, api_key, gemini_voice, local_voice),
+        args=(text, use_cloud, api_key, gemini_voice, local_voice, my_gen),
         daemon=True, name="levity-speak",
     ).start()
 
@@ -1164,6 +1203,8 @@ async def voice_toggle(action: str) -> str:
             - "stop" — deactivate voice service
             - "response_on" — enable voice_speak audio playback
             - "response_off" — silence voice_speak
+            - "mode_quick" — prefer voice_confirm (yes/no) for input
+            - "mode_full" — prefer voice_listen (free-form) for input
             - "status" — return current state of all toggles
 
     Returns:
@@ -1424,4 +1465,11 @@ if __name__ == "__main__":
     ).start()
     _maybe_launch_menubar()
 
-    mcp.run()
+    # On a clean transport close, mcp.run() returns and we remove our own PID
+    # file (the guard in _remove_pid_file no-ops if a newer instance already
+    # took ownership). Signal-driven exits still go through _graceful_shutdown,
+    # which deliberately skips this and leaves cleanup to the next startup.
+    try:
+        mcp.run()
+    finally:
+        _remove_pid_file()
