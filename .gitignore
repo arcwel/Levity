@@ -44,3 +44,4 @@ server.pid
 server.pid.tmp
 menubar.pid
 voiced.pid
+.pytest_cache/

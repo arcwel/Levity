@@ -2,7 +2,7 @@
 # Install:  pip install -r requirements.txt
 
 # MCP server framework (all platforms)
-mcp>=1.27
+mcp>=1.27,<2  # 2.x renamed FastMCP; server.py targets 1.x
 
 # Speech-to-text for voice_confirm (all platforms). openai-whisper pulls in
 # torch; the numpy-array transcription path needs no system ffmpeg.

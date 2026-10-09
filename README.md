@@ -208,6 +208,11 @@ Record a short yes/no reply from the microphone and return `{"decision": "yes"|"
 ### `voice_listen(timeout=30.0)`
 Record free-form speech and return the Whisper transcript. Requires `server_active`.
 
+## Tests
+
+Run offline (no audio hardware, Whisper models, or network): `pip install pytest -r requirements.txt` then `python -m pytest -q`.
+Tests needing real hardware carry the `hardware` marker and are deselected by default; run them with `python -m pytest -m hardware`.
+
 ## License
 
 MIT
